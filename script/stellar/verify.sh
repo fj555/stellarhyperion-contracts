@@ -9,6 +9,11 @@
 # wrote down" is a question somebody asks weeks later, during an incident, from a machine that never
 # ran the deployment. It should not require reading nine invoke commands off a wiki.
 #
+# Deprecation: a record that is archived (status "deprecated" or "retired") or that names a
+# successor is NOT an active deployment. verify.sh refuses to monitor it as if it were current,
+# prints the successor link, and fails with an actionable warning rather than silently passing.
+# Historical transaction evidence in the record is never discarded by this check.
+#
 # Usage: script/stellar/verify.sh
 source "$(dirname "$0")/lib.sh"
 require_tools
@@ -22,12 +27,40 @@ process.stdout.write(Object.keys(d.networks??{})[0]??"");
 ' "$RECORD")
 [ -n "$CHAIN_KEY" ] || die "the record names no network"
 
+# Lifecycle metadata. A record is active unless it declares otherwise. Parsed, not grepped.
+LIFECYCLE=$(node -e '
+const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+const n=d.networks[process.argv[2]]??{};
+const lc=n.lifecycle??d.lifecycle??{};
+const status=lc.status??"active";
+const successor=lc.successor??lc.successorRecord??"";
+const reason=lc.reason??"";
+process.stdout.write(JSON.stringify({status,successor,reason}));
+' "$RECORD" "$CHAIN_KEY")
+LC_STATUS=$(printf '%s' "$LIFECYCLE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).status))')
+LC_SUCCESSOR=$(printf '%s' "$LIFECYCLE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).successor))')
+LC_REASON=$(printf '%s' "$LIFECYCLE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).reason))')
+
 ROUTER=$(json_get "$RECORD" "networks.$CHAIN_KEY.router")
 
 note "the record"
 say "file             $RECORD"
 say "network key      $CHAIN_KEY"
 say "router           $ROUTER"
+say "lifecycle        $LC_STATUS"
+
+if [ "$LC_STATUS" != "active" ]; then
+  printf '\033[33mWARNING: this record is %s and is not an active deployment.\033[0m\n' "$LC_STATUS"
+  [ -n "$LC_REASON" ] && say "reason           $LC_REASON"
+  if [ -n "$LC_SUCCESSOR" ]; then
+    say "successor        $LC_SUCCESSOR"
+    say "action           monitor the successor record instead: HYPERION_RECORD=$LC_SUCCESSOR script/stellar/verify.sh"
+  else
+    say "action           no successor is linked; do not activate or monitor this router until one is recorded"
+  fi
+  say "historical transaction evidence is retained in the record and is not affected by this refusal."
+  die "refusing to verify a $LC_STATUS deployment as if it were active"
+fi
 
 problems=0
 check() {

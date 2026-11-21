@@ -1,0 +1,85 @@
+{
+  "sender": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+  "expectedIntent": {
+    "sender": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+    "token": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    "netAmount": "99950000",
+    "expectedSpender": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    "isBurn": true,
+    "feeRecipient": "GDE34Q275W537R5V2IUVB5P46777EAUCL3G63JZXF6KUS7V6W42C6K4N",
+    "feeAmount": "50000",
+    "gasToken": "CGAS7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32GAS",
+    "gasRecipient": "CITS7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32ITS",
+    "gasAmount": "1000"
+  },
+  "authTree": {
+    "contract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+    "function": "bridge_out_with_gas",
+    "args": {
+      "sender": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+      "token": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+      "amount": "100000000",
+      "destinationChain": "ethereum",
+      "destinationAddress": "0x1111111111111111111111111111111111111111",
+      "gasAmount": "1000"
+    },
+    "subInvocations": [
+      {
+        "contract": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+        "function": "transfer",
+        "args": {
+          "from": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+          "to": "GDE34Q275W537R5V2IUVB5P46777EAUCL3G63JZXF6KUS7V6W42C6K4N",
+          "amount": "50000"
+        },
+        "subInvocations": []
+      },
+      {
+        "contract": "CBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32AAA",
+        "function": "dispatch_from",
+        "args": {
+          "caller": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+          "sender": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+          "token": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+          "amount": "99950000",
+          "destinationChain": "ethereum",
+          "destination": "0x1111111111111111111111111111111111111111",
+          "nonce": "1",
+          "gasAmount": "1000"
+        },
+        "subInvocations": [
+          {
+            "contract": "CITS7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32ITS",
+            "function": "interchain_transfer",
+            "args": {
+              "caller": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+              "destinationChain": "ethereum",
+              "amount": "99950000"
+            },
+            "subInvocations": [
+              {
+                "contract": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+                "function": "burn",
+                "args": {
+                  "from": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+                  "amount": "99950000"
+                },
+                "subInvocations": []
+              },
+              {
+                "contract": "CGAS7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32GAS",
+                "function": "transfer",
+                "args": {
+                  "from": "GBBD7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32N3Q",
+                  "to": "CATTACKER7PQXN7P55U25D2BWWX7AUKC7E3AOP7XGQLB7IYY3Z3QWVQO32EVIL",
+                  "amount": "1000"
+                },
+                "subInvocations": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

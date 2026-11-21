@@ -8,7 +8,9 @@ import {
     DecimalOverflow,
     InvalidAmount,
     InvalidDestination,
+    InvalidLimit,
     MalformedMessage,
+    ProviderBudgetExceeded,
     RailNotConfigured,
     RefundFailed,
     ReplayedMessage,
@@ -16,6 +18,8 @@ import {
     TimelockNotQueued,
     TimelockNotReady,
     TokenNotMapped,
+    TopUpBindingMismatch,
+    TopUpIntentNotFound,
     Unauthorized,
     UnexpectedRailContract,
     UnknownChain,
@@ -23,7 +27,13 @@ import {
     ZeroAddress,
     ZeroAddressKey
 } from "../../src/HyperionErrors.sol";
-import {AddressKind, Destination, RouteKind} from "../../src/HyperionTypes.sol";
+import {
+    AddressKind,
+    Destination,
+    RouteKind,
+    TokenMappingConflict,
+    TokenMappingReport
+} from "../../src/HyperionTypes.sol";
 import {AxelarItsAdapter} from "../../src/adapters/AxelarItsAdapter.sol";
 import {IHyperionRouter} from "../../src/interfaces/IHyperionRouter.sol";
 import {Fixture} from "../Fixture.sol";
@@ -31,6 +41,7 @@ import {DeafRouter} from "../mocks/HostileCallers.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockGasService} from "../mocks/MockGasService.sol";
 import {MockIts} from "../mocks/MockIts.sol";
+import {MockTokenManager} from "../mocks/MockTokenManager.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 /// @title The rail that goes both ways
@@ -84,6 +95,23 @@ contract AxelarItsAdapterTest is Fixture {
     event TransferSubmitted(
         string chain, bytes32 tokenId, uint256 amount, uint64 nonce, uint256 gasValue, bytes note
     );
+    event TransferIntentRecorded(
+        bytes32 indexed intentId,
+        bytes32 indexed destinationBinding,
+        bytes32 tokenId,
+        address token,
+        uint256 amount,
+        uint64 nonce,
+        address sender
+    );
+    event GasTopUpBound(
+        bytes32 indexed intentId,
+        bytes32 indexed txHash,
+        uint256 logIndex,
+        address refundAddress,
+        uint256 maxNativeSpend
+    );
+    event GasToppedUp(bytes32 indexed intentId, uint256 amount, uint256 totalSpent);
     event DeliveryAccepted(
         string sourceChain,
         bytes32 indexed commandId,
@@ -105,6 +133,10 @@ contract AxelarItsAdapterTest is Fixture {
         vm.startPrank(admin);
         adapter.setPeer(STELLAR, AXELAR_STELLAR, peerAddress);
         adapter.linkToken(address(usdc), TOKEN_ID);
+        adapter.setDestinationCapability(
+            STELLAR, address(usdc), 4, AxelarItsAdapter.DestinationCapability.GmpPayload
+        );
+        adapter.setDevelopmentGate(true, keccak256("independently validated test fixture"));
         vm.stopPrank();
 
         // The router only takes an arrival from the contract it was told speaks for this rail.
@@ -142,6 +174,12 @@ contract AxelarItsAdapterTest is Fixture {
         new AxelarItsAdapter(address(router), address(its), address(0), admin);
     }
 
+    function test_evm_development_gate_starts_closed() public {
+        AxelarItsAdapter unvalidated =
+            new AxelarItsAdapter(address(router), address(its), address(gasService), admin);
+        assertFalse(unvalidated.developmentGateOpen());
+    }
+
     function test_route_is_axelar_its() public view {
         assertEq(uint256(adapter.route()), uint256(RouteKind.AxelarIts));
     }
@@ -171,6 +209,60 @@ contract AxelarItsAdapterTest is Fixture {
         assertTrue(peer.enabled);
         assertTrue(adapter.supportsChain(STELLAR));
         assertEq(adapter.chainForAxelarName(AXELAR_STELLAR), STELLAR);
+    }
+
+    function test_closed_development_gate_refuses_dispatch_before_custody_changes() public {
+        vm.prank(admin);
+        adapter.setDevelopmentGate(false, bytes32(0));
+        _fund(AMOUNT);
+        vm.prank(address(router));
+        vm.expectRevert(RailNotConfigured.selector);
+        adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
+        assertEq(usdc.balanceOf(address(adapter)), AMOUNT);
+        assertEq(its.sentCount(), 0);
+    }
+
+    function test_dispatch_refuses_a_pair_without_an_admitted_capability() public {
+        AxelarItsAdapter unadmitted =
+            new AxelarItsAdapter(address(router), address(its), address(gasService), admin);
+        vm.startPrank(admin);
+        unadmitted.setPeer(STELLAR, AXELAR_STELLAR, peerAddress);
+        unadmitted.linkToken(address(usdc), TOKEN_ID);
+        unadmitted.setDevelopmentGate(true, keccak256("independently validated test fixture"));
+        vm.stopPrank();
+
+        usdc.mint(address(unadmitted), AMOUNT);
+        vm.prank(address(router));
+        vm.expectRevert(RailNotConfigured.selector);
+        unadmitted.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
+        assertEq(usdc.balanceOf(address(unadmitted)), AMOUNT);
+        assertEq(its.sentCount(), 0);
+    }
+
+    function test_dispatch_refuses_a_pair_if_its_manager_type_changed() public {
+        _fund(AMOUNT);
+        its.setManagerType(2);
+
+        vm.prank(address(router));
+        vm.expectRevert(RailNotConfigured.selector);
+        adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
+
+        assertEq(usdc.balanceOf(address(adapter)), AMOUNT);
+        assertEq(its.sentCount(), 0);
+    }
+
+    function test_capability_admission_checks_the_live_its_manager_type() public {
+        MockERC20 other = new MockERC20("Other", "OTH", 18);
+        bytes32 otherId = keccak256("hyperion.its.other");
+        its.setRegistered(otherId, address(other));
+        vm.prank(admin);
+        adapter.linkToken(address(other), otherId);
+
+        vm.prank(admin);
+        vm.expectRevert(RailNotConfigured.selector);
+        adapter.setDestinationCapability(
+            STELLAR, address(other), 2, AxelarItsAdapter.DestinationCapability.GmpPayload
+        );
     }
 
     /// @dev Axelar calls BNB Chain "binance". Hyperion's names are its own, and the whole reason
@@ -382,6 +474,10 @@ contract AxelarItsAdapterTest is Fixture {
         vm.warp(block.timestamp + 1 hours);
         vm.prank(admin);
         adapter.applyPeerRotation(STELLAR);
+        vm.prank(admin);
+        adapter.setDestinationCapability(
+            STELLAR, address(usdc), 4, AxelarItsAdapter.DestinationCapability.GmpPayload
+        );
         bytes32 res3 = its.deliver(
             address(adapter),
             keccak256("cmd3"),
@@ -518,6 +614,10 @@ contract AxelarItsAdapterTest is Fixture {
         vm.warp(block.timestamp + 1 hours);
         vm.prank(admin);
         adapter.applyPeerRotation(STELLAR);
+        vm.prank(admin);
+        adapter.setDestinationCapability(
+            STELLAR, address(usdc), 4, AxelarItsAdapter.DestinationCapability.GmpPayload
+        );
         uint256 itsBefore = usdc.balanceOf(address(its));
         vm.expectRevert(ReplayedMessage.selector);
         its.deliver(
@@ -578,10 +678,19 @@ contract AxelarItsAdapterTest is Fixture {
         adapter.linkToken(makeAddr("token"), bytes32(0));
     }
 
-    function test_link_token_refuses_a_second_link() public {
+    /// @dev A deploy script that runs twice should be boring. Repeating the link that is already
+    /// in place succeeds and changes nothing, rather than reverting on a config that is correct.
+    function test_link_token_repeating_the_same_link_is_a_no_op() public {
+        vm.recordLogs();
         vm.prank(admin);
-        vm.expectRevert(AlreadyConfigured.selector);
         adapter.linkToken(address(usdc), TOKEN_ID);
+
+        assertEq(adapter.tokenIdOf(address(usdc)), TOKEN_ID);
+        // No second `TokenLinked`: nothing changed, so there is nothing to announce.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertTrue(logs[i].topics[0] != TokenLinked.selector, "republished TokenLinked");
+        }
     }
 
     /// @dev A token id is the same value on every chain, which makes it exactly the sort of
@@ -592,6 +701,15 @@ contract AxelarItsAdapterTest is Fixture {
         MockERC20 other = new MockERC20("Other", "OTH", 18);
         vm.prank(admin);
         vm.expectRevert(TokenNotMapped.selector);
+        adapter.linkToken(address(other), keccak256("hyperion.its.nobody.registered.this"));
+    }
+
+    /// @dev And the same mistake in the other direction: the id is real but belongs to somebody
+    /// else's asset, so linking it here would make an inbound delivery pay a token nobody linked.
+    function test_link_token_refuses_an_id_its_backs_with_another_asset() public {
+        MockERC20 other = new MockERC20("Other", "OTH", 18);
+        vm.prank(admin);
+        vm.expectRevert(AlreadyConfigured.selector);
         adapter.linkToken(address(other), TOKEN_ID);
     }
 
@@ -610,6 +728,10 @@ contract AxelarItsAdapterTest is Fixture {
         vm.prank(stranger);
         vm.expectRevert(Unauthorized.selector);
         adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
+
+        vm.prank(stranger);
+        vm.expectRevert(Unauthorized.selector);
+        adapter.dispatchWithSender(address(usdc), AMOUNT, _dest(G_ADDR), NONCE, alice);
     }
 
     function test_dispatch_refuses_a_zero_amount() public {
@@ -770,6 +892,10 @@ contract AxelarItsAdapterTest is Fixture {
         vm.startPrank(admin);
         orphan.setPeer(STELLAR, AXELAR_STELLAR, peerAddress);
         orphan.linkToken(address(usdc), TOKEN_ID);
+        orphan.setDestinationCapability(
+            STELLAR, address(usdc), 4, AxelarItsAdapter.DestinationCapability.GmpPayload
+        );
+        orphan.setDevelopmentGate(true, keccak256("independently validated test fixture"));
         vm.stopPrank();
 
         usdc.mint(address(orphan), AMOUNT);
@@ -1000,22 +1126,142 @@ contract AxelarItsAdapterTest is Fixture {
     // Gas top ups
     // -------------------------------------------------------------------------------------
 
-    /// @dev Permissionless on purpose. A stuck transfer is somebody's money, and the person most
-    /// motivated to unstick it is not always whoever holds the operator keys.
-    function test_anybody_can_pay_to_unstick_a_delivery() public {
+    /// @dev Only the original sender can bind and pay a top-up against the recorded intent.
+    function test_original_sender_can_pay_a_bounded_top_up_for_a_bound_delivery() public {
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
         bytes32 txHash = keccak256("the.transaction.that.ran.short");
-        vm.deal(stranger, 1 ether);
+        vm.deal(alice, 1 ether);
 
+        AxelarItsAdapter.TopUpMetadata memory metadata =
+            _topUpMetadata(intentId, destinationBinding, txHash, 3, alice, 0.5 ether);
+        vm.deal(stranger, 1 ether);
         vm.prank(stranger);
-        adapter.topUpGas{value: 0.25 ether}(txHash, 3, stranger);
+        vm.expectRevert(Unauthorized.selector);
+        adapter.topUpGas{value: 0.01 ether}(metadata);
+        metadata.sender = stranger;
+        vm.prank(alice);
+        vm.expectRevert(Unauthorized.selector);
+        adapter.topUpGas{value: 0.01 ether}(metadata);
+        metadata.sender = alice;
+        vm.expectEmit(true, true, false, true, address(adapter));
+        emit GasTopUpBound(intentId, txHash, 3, alice, 0.5 ether);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit GasToppedUp(intentId, 0.25 ether, 0.25 ether);
+        vm.prank(alice);
+        adapter.topUpGas{value: 0.25 ether}(metadata);
 
         MockGasService.TopUp memory top = gasService.lastTopUp();
         assertEq(gasService.topUpCount(), 1);
         assertEq(top.txHash, txHash);
         assertEq(top.logIndex, 3);
-        assertEq(top.refundAddress, stranger);
+        assertEq(top.refundAddress, alice);
         assertEq(top.value, 0.25 ether, "all of it, with nothing held back");
         assertEq(address(adapter).balance, 0);
+        AxelarItsAdapter.TransferIntent memory intent = adapter.topUpIntent(intentId);
+        assertEq(intent.token, address(usdc));
+        assertEq(intent.tokenId, TOKEN_ID);
+        assertEq(intent.amount, AMOUNT);
+        assertEq(intent.sender, alice);
+        assertEq(intent.destinationBinding, destinationBinding);
+        assertEq(intent.nativeSpent, 0.25 ether);
+    }
+
+    function test_top_ups_may_repeat_only_with_the_same_message_and_refund_binding() public {
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
+        bytes32 txHash = keccak256("the.transaction.that.ran.short");
+        vm.deal(alice, 1 ether);
+        AxelarItsAdapter.TopUpMetadata memory metadata =
+            _topUpMetadata(intentId, destinationBinding, txHash, 3, alice, 0.5 ether);
+
+        vm.prank(alice);
+        adapter.topUpGas{value: 0.2 ether}(metadata);
+        vm.prank(alice);
+        adapter.topUpGas{value: 0.3 ether}(metadata);
+        assertEq(gasService.topUpCount(), 2);
+        assertEq(adapter.topUpIntent(intentId).nativeSpent, 0.5 ether);
+
+        metadata.txHash = keccak256("a different delivery");
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.01 ether}(metadata);
+
+        metadata.txHash = txHash;
+        metadata.refundAddress = bob;
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.01 ether}(metadata);
+        assertEq(gasService.topUpCount(), 2);
+    }
+
+    function test_one_source_message_cannot_be_bound_to_another_destination_intent() public {
+        (bytes32 firstIntent, bytes32 firstDestination) = _dispatchIntent();
+        (bytes32 secondIntent, bytes32 secondDestination) = _dispatchIntentAt(NONCE + 1);
+        bytes32 txHash = keccak256("one Axelar source transaction");
+        vm.deal(alice, 1 ether);
+
+        AxelarItsAdapter.TopUpMetadata memory first =
+            _topUpMetadata(firstIntent, firstDestination, txHash, 3, alice, 1 ether);
+        vm.prank(alice);
+        adapter.topUpGas{value: 0.1 ether}(first);
+
+        AxelarItsAdapter.TopUpMetadata memory second =
+            _topUpMetadata(secondIntent, secondDestination, txHash, 3, alice, 1 ether);
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.1 ether}(second);
+        assertEq(gasService.topUpCount(), 1);
+    }
+
+    function test_top_up_rejects_changed_destination_token_or_original_amount() public {
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
+        vm.deal(alice, 1 ether);
+        AxelarItsAdapter.TopUpMetadata memory metadata =
+            _topUpMetadata(intentId, destinationBinding, keccak256("source transaction"), 0, alice, 1 ether);
+
+        metadata.destinationBinding = keccak256("another destination");
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.1 ether}(metadata);
+
+        metadata.destinationBinding = destinationBinding;
+        metadata.token = address(router);
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.1 ether}(metadata);
+
+        metadata.token = address(usdc);
+        metadata.originalAmount = AMOUNT + 1;
+        vm.prank(alice);
+        vm.expectRevert(TopUpBindingMismatch.selector);
+        adapter.topUpGas{value: 0.1 ether}(metadata);
+        assertEq(gasService.topUpCount(), 0);
+    }
+
+    function test_top_up_requires_a_real_intent_and_enforces_a_cumulative_native_cap() public {
+        vm.deal(alice, 1 ether);
+        AxelarItsAdapter.TopUpMetadata memory missing = _topUpMetadata(
+            keccak256("not an outbound transfer"),
+            bytes32(0),
+            keccak256("source transaction"),
+            0,
+            alice,
+            0.25 ether
+        );
+        vm.prank(alice);
+        vm.expectRevert(TopUpIntentNotFound.selector);
+        adapter.topUpGas{value: 0.1 ether}(missing);
+
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
+        AxelarItsAdapter.TopUpMetadata memory metadata = _topUpMetadata(
+            intentId, destinationBinding, keccak256("source transaction"), 0, alice, 0.25 ether
+        );
+        vm.prank(alice);
+        adapter.topUpGas{value: 0.2 ether}(metadata);
+        vm.prank(alice);
+        vm.expectRevert(ProviderBudgetExceeded.selector);
+        adapter.topUpGas{value: 0.06 ether}(metadata);
+        assertEq(gasService.topUpCount(), 1);
+        assertEq(adapter.topUpIntent(intentId).nativeSpent, 0.2 ether);
     }
 
     /// @dev Axelar's relayer pays the refund back in its own transaction, long after the one
@@ -1045,18 +1291,37 @@ contract AxelarItsAdapterTest is Fixture {
     }
 
     function test_a_top_up_of_nothing_is_refused() public {
-        vm.prank(stranger);
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
+        vm.prank(alice);
         vm.expectRevert(InvalidAmount.selector);
-        adapter.topUpGas(keccak256("x"), 0, stranger);
+        adapter.topUpGas(
+            _topUpMetadata(intentId, destinationBinding, keccak256("source transaction"), 0, alice, 1 ether)
+        );
     }
 
     /// @dev Axelar sends the unspent remainder to the refund address, so a zero one is a way of
     /// burning the difference rather than a way of declining it.
     function test_a_top_up_with_nowhere_to_refund_is_refused() public {
-        vm.deal(stranger, 1 ether);
-        vm.prank(stranger);
+        (bytes32 intentId, bytes32 destinationBinding) = _dispatchIntent();
+        vm.deal(alice, 1 ether);
+        AxelarItsAdapter.TopUpMetadata memory metadata = _topUpMetadata(
+            intentId, destinationBinding, keccak256("source transaction"), 0, address(0), 1 ether
+        );
+        vm.prank(alice);
         vm.expectRevert(ZeroAddress.selector);
-        adapter.topUpGas{value: 0.1 ether}(keccak256("x"), 0, address(0));
+        adapter.topUpGas{value: 0.1 ether}(metadata);
+    }
+
+    function test_dispatch_bounds_destination_metadata_for_top_up_intents() public {
+        string memory tooLongChain = string(new bytes(adapter.MAX_DESTINATION_CHAIN_LENGTH() + 1));
+        vm.prank(address(router));
+        vm.expectRevert(InvalidLimit.selector);
+        adapter.dispatch(address(usdc), AMOUNT, Destination(tooLongChain, G_ADDR), NONCE);
+
+        string memory tooLongAddress = string(new bytes(adapter.MAX_DESTINATION_STRKEY_LENGTH() + 1));
+        vm.prank(address(router));
+        vm.expectRevert(InvalidLimit.selector);
+        adapter.dispatch(address(usdc), AMOUNT, Destination(STELLAR, tooLongAddress), NONCE);
     }
 
     function test_inspect_outbound_note() public view {
@@ -1086,12 +1351,261 @@ contract AxelarItsAdapterTest is Fixture {
         adapter.inspectInboundNote(badNote);
     }
 
+    function test_inspect_paid_dispatch_targets() public view {
+        (address itsSpender, address gasServiceRecipient) = adapter.inspectPaidDispatchTargets();
+        assertEq(itsSpender, address(its));
+        assertEq(gasServiceRecipient, address(gasService));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Registration diagnostics
+    // -------------------------------------------------------------------------------------
+
+    /// @dev An address with no code behind it, which is what an operator gets when they paste
+    /// something from the wrong column. It answers nothing, so its decimals are unknown rather
+    /// than wrong, and the two findings have different fixes.
+    function _muteToken() internal pure returns (address) {
+        return address(0xDEAF);
+    }
+
+    function test_check_token_mapping_reports_a_compatible_registration() public {
+        MockTokenManager manager = new MockTokenManager(4);
+        its.setTokenManager(TOKEN_ID, address(manager));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 6, true, 4, true);
+
+        assertEq(report.conflicts.length, 0);
+        assertEq(report.token, address(usdc));
+        assertEq(report.tokenId, TOKEN_ID);
+        assertEq(report.mappedTokenId, TOKEN_ID);
+        assertEq(report.mappedToken, address(usdc));
+        assertEq(report.railToken, address(usdc));
+        assertEq(report.railManager, address(manager));
+        assertEq(report.railManagerType, 4);
+        assertEq(report.onchainDecimals, 6);
+        assertTrue(report.decimalsKnown);
+    }
+
+    /// @dev Observed but unjudged: an operator checking only the ids should not have to guess at
+    /// the other two fields to get a useful answer.
+    function test_check_token_mapping_only_judges_what_the_caller_states() public view {
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 0, false, 0, false);
+        assertEq(report.conflicts.length, 0);
+    }
+
+    function test_check_token_mapping_names_an_id_already_linked_to_another_token() public {
+        // `other` is already linked to `otherId`, and this proposes linking it to a second id.
+        // Nothing about the rail is wrong; the local map is, in one direction only.
+        MockERC20 other = new MockERC20("Other", "OTH", 18);
+        bytes32 otherId = keccak256("hyperion.its.other");
+        bytes32 secondId = keccak256("hyperion.its.other.second");
+        its.setRegistered(otherId, address(other));
+        its.setRegistered(secondId, address(other));
+        vm.prank(admin);
+        adapter.linkToken(address(other), otherId);
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(other), secondId, 0, false, 0, false);
+
+        assertEq(report.mappedTokenId, otherId);
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.TokenId));
+    }
+
+    function test_check_token_mapping_names_a_token_already_linked_to_another_id() public {
+        // The reverse direction, and the one that matters for money arriving: the reverse map is
+        // what decides which asset an inbound delivery is paid in.
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(makeAddr("stranger-token"), TOKEN_ID, 0, false, 0, false);
+
+        assertEq(report.mappedToken, address(usdc));
+        assertEq(report.conflicts.length, 2);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.LocalToken));
+        assertEq(uint8(report.conflicts[1]), uint8(TokenMappingConflict.RailTokenMismatch));
+    }
+
+    function test_check_token_mapping_names_an_id_axelar_never_heard_of() public {
+        // A token nothing has linked, and an id ITS has no record of. One finding, and it is the
+        // rail's, not the local map's.
+        TokenMappingReport memory report = adapter.checkTokenMapping(
+            makeAddr("unlinked-token"), keccak256("hyperion.its.nobody"), 0, false, 0, false
+        );
+
+        assertEq(report.railToken, address(0));
+        assertEq(report.railManager, address(0));
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.UnregisteredTokenId));
+    }
+
+    function test_check_token_mapping_names_an_id_its_backs_with_another_asset() public {
+        MockERC20 other = new MockERC20("Other", "OTH", 18);
+        its.setRegistered(TOKEN_ID, address(other));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 0, false, 0, false);
+
+        assertEq(report.railToken, address(other));
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.RailTokenMismatch));
+    }
+
+    function test_check_token_mapping_names_decimals_that_disagree() public view {
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 7, true, 0, false);
+
+        assertEq(report.onchainDecimals, 6);
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.Decimals));
+    }
+
+    function test_check_token_mapping_names_a_manager_kind_that_disagrees() public {
+        MockTokenManager manager = new MockTokenManager(2);
+        its.setTokenManager(TOKEN_ID, address(manager));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 0, false, 4, true);
+
+        assertEq(report.railManager, address(manager));
+        assertEq(report.railManagerType, 2);
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.ManagerType));
+    }
+
+    /// @dev A manager that reports kind zero is a real manager of a real kind, not a missing one.
+    /// Reading absence from the type rather than from the address would call this unregistered.
+    function test_check_token_mapping_treats_kind_zero_as_a_real_manager() public {
+        MockTokenManager manager = new MockTokenManager(0);
+        its.setTokenManager(TOKEN_ID, address(manager));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 0, false, 0, true);
+
+        assertEq(report.conflicts.length, 0);
+        assertEq(report.railManagerType, 0);
+        assertEq(report.railManager, address(manager));
+    }
+
+    /// @dev A manager address that answers nothing is a manager this build cannot judge, which is
+    /// the same finding as no manager at all: there is nothing to route through that can be
+    /// confirmed. The alternative, treating kind zero as "unknown", would silently accept it.
+    function test_check_token_mapping_names_a_manager_that_answers_nothing() public {
+        its.setTokenManager(TOKEN_ID, makeAddr("mute-manager"));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(usdc), TOKEN_ID, 0, false, 4, true);
+
+        assertEq(report.railManager, makeAddr("mute-manager"));
+        assertFalse(report.managerTypeKnown);
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.UnregisteredTokenId));
+    }
+
+    function test_check_token_mapping_names_unreadable_metadata() public {
+        address mute = _muteToken();
+        bytes32 muteId = keccak256("hyperion.its.mute");
+        its.setRegistered(muteId, mute);
+
+        TokenMappingReport memory report = adapter.checkTokenMapping(mute, muteId, 6, true, 0, false);
+
+        assertFalse(report.decimalsKnown);
+        assertEq(report.conflicts.length, 1);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.UnreadableMetadata));
+    }
+
+    /// @dev One call, every disagreement, in the order the Stellar side uses. A diagnostic that
+    /// stopped at the first would need as many round trips as there are fields.
+    function test_check_token_mapping_reports_every_disagreement_at_once() public {
+        // `other` is already linked to `otherId`, and ITS backs USDC's id with a third asset.
+        // Asking about `other` under USDC's id is therefore wrong in five separate ways: the local
+        // map disagrees in both directions, the rail disagrees, the decimals are not seven, and
+        // the manager is not a lock-unlock one.
+        MockERC20 other = new MockERC20("Other", "OTH", 18);
+        MockERC20 third = new MockERC20("Third", "THD", 18);
+        bytes32 otherId = keccak256("hyperion.its.other");
+        its.setRegistered(otherId, address(other));
+        its.setTokenManager(TOKEN_ID, address(new MockTokenManager(4)));
+        vm.prank(admin);
+        adapter.linkToken(address(other), otherId);
+        its.setRegistered(TOKEN_ID, address(third));
+
+        TokenMappingReport memory report =
+            adapter.checkTokenMapping(address(other), TOKEN_ID, 7, true, 2, true);
+
+        assertEq(report.conflicts.length, 5);
+        assertEq(uint8(report.conflicts[0]), uint8(TokenMappingConflict.TokenId));
+        assertEq(uint8(report.conflicts[1]), uint8(TokenMappingConflict.LocalToken));
+        assertEq(uint8(report.conflicts[2]), uint8(TokenMappingConflict.RailTokenMismatch));
+        assertEq(uint8(report.conflicts[3]), uint8(TokenMappingConflict.Decimals));
+        assertEq(uint8(report.conflicts[4]), uint8(TokenMappingConflict.ManagerType));
+    }
+
+    function test_check_token_mapping_writes_nothing() public {
+        its.setTokenManager(TOKEN_ID, address(new MockTokenManager(4)));
+        vm.recordLogs();
+
+        adapter.checkTokenMapping(address(usdc), TOKEN_ID, 6, true, 4, true);
+
+        // A dry run that emitted `TokenLinked` would have indexers recording a link that never
+        // happened, so the absence of an event is part of the promise.
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertEq(adapter.tokenIdOf(address(usdc)), TOKEN_ID);
+        assertEq(adapter.tokenOfId(TOKEN_ID), address(usdc));
+    }
+
     // -------------------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------------------
 
     function _fund(uint256 amount) internal {
         usdc.mint(address(adapter), amount);
+    }
+
+    function _dispatchIntent() internal returns (bytes32 intentId, bytes32 destinationBinding) {
+        return _dispatchIntentAt(NONCE);
+    }
+
+    function _dispatchIntentAt(uint64 nonce) internal returns (bytes32 intentId, bytes32 destinationBinding) {
+        _fund(AMOUNT);
+        AxelarItsAdapter.Peer memory peer = adapter.peerOf(STELLAR);
+        destinationBinding = keccak256(abi.encode(STELLAR, G_ADDR, peer.axelarChain, peer.peer));
+        intentId = keccak256(
+            abi.encode(
+                block.chainid,
+                address(adapter),
+                nonce,
+                destinationBinding,
+                TOKEN_ID,
+                address(usdc),
+                AMOUNT,
+                alice
+            )
+        );
+        vm.prank(address(router));
+        adapter.dispatchWithSender(address(usdc), AMOUNT, _dest(G_ADDR), nonce, alice);
+    }
+
+    function _topUpMetadata(
+        bytes32 intentId,
+        bytes32 destinationBinding,
+        bytes32 txHash,
+        uint256 logIndex,
+        address refundAddress,
+        uint256 maxNativeSpend
+    ) internal view returns (AxelarItsAdapter.TopUpMetadata memory) {
+        return AxelarItsAdapter.TopUpMetadata({
+            intentId: intentId,
+            sender: alice,
+            txHash: txHash,
+            logIndex: logIndex,
+            destinationBinding: destinationBinding,
+            tokenId: TOKEN_ID,
+            token: address(usdc),
+            originalAmount: AMOUNT,
+            refundAddress: refundAddress,
+            maxNativeSpend: maxNativeSpend
+        });
     }
 
     function _deliver(bytes32 commandId, address recipient, uint256 amount) internal returns (bytes32) {

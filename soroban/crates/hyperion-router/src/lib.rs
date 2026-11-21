@@ -277,37 +277,32 @@ impl HyperionRouter {
         let this = env.current_contract_address();
         let mut results = vec![&env];
         for id in ids.iter() {
-            if storage::is_claim_archived(&env, id) {
-                results.push_back(ClaimSettlementResult { id, status: 2 });
-                continue;
-            }
-            let Some(claim) = storage::claim(&env, id) else {
-                results.push_back(ClaimSettlementResult { id, status: 1 });
-                continue;
+            let status = if storage::is_claim_archived(&env, id) {
+                2
+            } else if let Some(mut claim) = storage::claim(&env, id) {
+                if claim.settled {
+                    2
+                } else {
+                    let client = token::Client::new(&env, &claim.token);
+                    let reason = attempt_payout(&client, &this, &claim.recipient, claim.amount)?;
+                    if reason == 0 {
+                        mark_claim_settled(&env, &mut claim)?;
+                        record_claim_settlement(&env, &claim, &settler);
+                        0
+                    } else {
+                        storage::set_claim_failure(&env, id, reason);
+                        events::claim_payout_failure_v1(&env, &claim, reason);
+                        match reason {
+                            1 => 3,
+                            2 => 4,
+                            _ => 5,
+                        }
+                    }
+                }
+            } else {
+                1
             };
-            if claim.settled {
-                results.push_back(ClaimSettlementResult { id, status: 2 });
-                continue;
-            }
-            let client = token::Client::new(&env, &claim.token);
-            let reason = attempt_payout(&client, &this, &claim.recipient, claim.amount)?;
-            if reason == 0 {
-                let mut claim = claim;
-                mark_claim_settled(&env, &mut claim)?;
-                record_claim_settlement(&env, &claim, &settler);
-                results.push_back(ClaimSettlementResult { id, status: 0 });
-                continue;
-            }
-            storage::set_claim_failure(&env, id, reason);
-            events::claim_payout_failure_v1(&env, &claim, reason);
-            results.push_back(ClaimSettlementResult {
-                id,
-                status: match reason {
-                    1 => 3,
-                    2 => 4,
-                    _ => 5,
-                },
-            });
+            results.push_back(ClaimSettlementResult { id, status });
         }
         Ok(results)
     }
@@ -431,20 +426,12 @@ impl HyperionRouter {
 
     // Stop new departures. Either key can do it, immediately, with no delay to sit through.
     pub fn pause(env: Env, caller: Address) -> Result<(), HyperionError> {
-        let mut cfg = require_authority(&env, &caller, true)?;
-        cfg.paused = true;
-        storage::set_config(&env, &cfg);
-        events::paused(&env, &caller, true);
-        Ok(())
+        set_pause_state(&env, &caller, true)
     }
 
     // Start again. Admin only, because deciding an incident is over is not a safety action.
     pub fn unpause(env: Env, caller: Address) -> Result<(), HyperionError> {
-        let mut cfg = require_authority(&env, &caller, false)?;
-        cfg.paused = false;
-        storage::set_config(&env, &cfg);
-        events::paused(&env, &caller, false);
-        Ok(())
+        set_pause_state(&env, &caller, false)
     }
 
     // Turn a rail off. No timelock: closing a lane only ever narrows what the bridge will do.
@@ -808,11 +795,7 @@ impl HyperionRouter {
                     Ok(RecipientEligibility::Unauthorized)
                 }
             }
-            Err(Ok(error))
-                if error == soroban_sdk::Error::from_contract_error(13)
-                    && client.address.executable()
-                        == Some(soroban_sdk::Executable::StellarAsset) =>
-            {
+            Err(Ok(error)) if is_missing_trustline(&client, error) => {
                 Ok(RecipientEligibility::MissingTrustline)
             }
             _ => Ok(RecipientEligibility::Unknown),
@@ -919,6 +902,14 @@ fn require_authority(
         return Err(HyperionError::Unauthorized);
     }
     Ok(cfg)
+}
+
+fn set_pause_state(env: &Env, caller: &Address, state: bool) -> Result<(), HyperionError> {
+    let mut cfg = require_authority(env, caller, state)?;
+    cfg.paused = state;
+    storage::set_config(env, &cfg);
+    events::paused(env, caller, state);
+    Ok(())
 }
 
 // A quote for a route that cannot be used, carrying the reason it cannot.
@@ -1380,18 +1371,17 @@ fn payout_failure_reason(client: &token::Client, router: &Address, amount: i128)
     }
 }
 
-// A built-in SAC reports contract error 13 for an absent account trustline.
+fn is_missing_trustline(client: &token::Client, error: soroban_sdk::Error) -> bool {
+    error == soroban_sdk::Error::from_contract_error(13)
+        && client.address.executable() == Some(soroban_sdk::Executable::StellarAsset)
+}
+
 // A built-in SAC reports contract error 13 for an absent account trustline.
 // Its balance is zero; arbitrary token balance errors are not trusted as zero.
 fn payout_balance(client: &token::Client, to: &Address) -> Result<i128, HyperionError> {
     match client.try_balance(to) {
         Ok(Ok(balance)) if balance >= 0 => Ok(balance),
-        Err(Ok(error))
-            if error == soroban_sdk::Error::from_contract_error(13)
-                && client.address.executable() == Some(soroban_sdk::Executable::StellarAsset) =>
-        {
-            Ok(0)
-        }
+        Err(Ok(error)) if is_missing_trustline(client, error) => Ok(0),
         _ => Err(HyperionError::InvalidAmount),
     }
 }

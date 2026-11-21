@@ -40,6 +40,30 @@ import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 The ABIs sit behind `@hyperion/protocol/abi` so an app that only wants to format an amount does not
 pull forty kilobytes of JSON into its bundle to get it.
 
+## Destination minimum planning
+
+`planForwardQuote` applies a caller-supplied forwarding reserve to an ordinary route quote, and
+`planInverseQuote` finds the smallest source amount that meets a requested destination minimum
+after that reserve. `quoteMinimumBatch` performs the same inversion for a list of minimums. These
+APIs use bigint end to end and the exact protocol-fee and representability floors used by
+`planQuote`; the inverse result includes the achieved minimum, rounding overshoot and its bound.
+
+The reserve is explicitly denominated in `destination-token-base-units` and is subtracted from the
+bridged amount before comparing the recipient minimum. It is not a provider gas estimate or a
+conversion from native gas to the bridged asset. Callers must supply a reserve appropriate to their
+provider and denomination; no provider pricing or exchange rate is assumed.
+
+These are planning primitives, not authorization to dispatch. The only independently validated
+outbound scope is Stellar Testnet USDC over CCTP to Sepolia, Base Sepolia or Arc Testnet, and over
+ITS to Sepolia. Consumers should gate outbound use with
+`validatedOutboundRoutesForPair` and `hasValidatedOutboundQuoteWiring`; generic `routesForPair`
+and `planQuote` describe configured/math capabilities, not launch validation. EVM-source routes
+and other rails remain gated until separately validated. This adds SDK APIs only: no wire format,
+ABI, authenticated rail dispatch, replay protection, or recipient-bound claim behavior changes.
+Existing `QuoteRequest` and quote results remain compatible; consumers opting into inverse plans
+must provide the explicit reserve unit and migrate UI copy to distinguish a destination-token
+reserve from gas units.
+
 ## Three decisions worth knowing about
 
 **No runtime dependencies.** Everything works on `Uint8Array` and `bigint`. No `Buffer`, no viem at
@@ -107,3 +131,78 @@ and Sepolia entries ship as defaults and are marked `confirmed: false`, because 
 everywhere else" is a reasonable inference and not a reading. Stellar's CCTP addresses are absent
 entirely rather than guessed; they come from the deployment record. Shipping a plausible address as
 if it were verified is how somebody loses money to a deploy script that looked fine.
+
+## Compare dated router snapshots
+
+`compareSnapshots` compares an explicitly dated collection using one source amount and destination.
+Each row includes a deterministic all-rail ladder and its best available quote. Rows sort by timestamp
+and ID; ties between rails use the existing canonical-asset/attestation policy in route enum order.
+Supply `route` only when comparing the same single rail over time; the complete ladder remains available.
+All amounts stay `bigint` throughout the comparison.
+
+```ts
+import { compareSnapshots } from "@hyperion/protocol";
+
+const representation = {
+  tokenDecimals: 6,
+  destinationNetwork: "stellar-testnet",
+  destinationTokenId: destinationSacId,
+  destinationDecimals: 7,
+};
+const comparisons = compareSnapshots(
+  { amount: 1_000_000n, strkey: recipient, destinationDecimals: 7 },
+  observations.map(({ id, takenAt, snapshot }) => ({
+    id,
+    takenAt,
+    snapshot,
+    network: "sepolia",
+    tokenId: sourceTokenAddress,
+    representation,
+  })),
+  { now: observedUnixSeconds, network: "sepolia", tokenId: sourceTokenAddress, representation },
+  60,
+);
+```
+
+Snapshot timestamps, the reference clock and maximum age are non-negative safe integer Unix seconds.
+The exact maximum-age boundary is fresh; future observations and malformed/duplicate IDs are separate
+statuses. An old observation is `stale`; a fresh snapshot whose rails refuse the request is `unavailable`.
+Invalid fee/precision/flow data is reported as `invalid`, rather than used in arithmetic.
+
+Compatibility binds source chain, source token contract and precision, destination chain, destination
+SAC/token contract and precision. Chain keys must be known and both ends must use the same network mode.
+EVM contract IDs normalize address case; Stellar SAC IDs require valid checksums. Tickers such as `USDC`
+are insufficient. Older unqualified `DatedSnapshot` inputs return `incompatible`; migrate by adding the
+concrete `representation` to both each observation and the reference. The existing quote, amount and
+SDK deployment lookup APIs remain intact.
+
+Every result is `planningOnly: true`. Caller-supplied snapshots are read-only planning evidence, not
+verified live state or an activation decision. This existing local quote engine accepts Stellar recipient
+strkeys and is suitable for EVM-to-Stellar development comparisons; it does not implement the active
+Stellar-to-EVM outbound quote interface. The active deployment remains Stellar Testnet outbound ITS/CCTP;
+EVM and other rail execution stays gated until independently validated. Confirm actual router quotes,
+network/token identities and provider costs through the applicable chain integration before execution.
+
+## Provider token addresses
+
+Deployment token records may include an optional `providerAddresses` object keyed by rail slug.
+These addresses are kept separate from the canonical token address and its declared decimals:
+
+```json
+{
+  "address": "0x...",
+  "decimals": 6,
+  "flowLimit": "1000000000",
+  "routes": ["cctp"],
+  "providerAddresses": { "cctp": "0x..." }
+}
+```
+
+`parseProviderAddressOverrides` validates external override data against known chains, asset
+capabilities, provider slugs, and the address format for each chain. Quote callers can use
+`resolveProviderAddressPair`, `planQuoteWithProviderAddresses`, or
+`quoteBatchWithProviderAddresses` to require both ends of a same-network route explicitly. Missing
+pairs and malformed values raise `ProviderAddressError` with the failing field path; canonical
+token addresses, chain identities, and precision are never inferred from or replaced by provider
+overrides. Older deployment records remain valid because the field is optional. Adding overrides
+is therefore data-only and requires no schema-version change.

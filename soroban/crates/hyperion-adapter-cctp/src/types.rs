@@ -1,5 +1,31 @@
 use soroban_sdk::{contracttype, Address, BytesN, String};
 
+/// The finality requirement selected for one CCTP destination lane.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FinalityPolicy {
+    Finalized,
+    Fast,
+}
+
+impl FinalityPolicy {
+    pub fn threshold(&self) -> u32 {
+        match self {
+            Self::Finalized => hyperion_core::cctp::FINALITY_THRESHOLD_FINALIZED,
+            Self::Fast => hyperion_core::cctp::FINALITY_THRESHOLD_FAST,
+        }
+    }
+}
+
+/// Lane-specific values shown to callers before a CCTP dispatch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchQuote {
+    pub destination_domain: u32,
+    pub max_fee: i128,
+    pub min_finality_threshold: u32,
+}
+
 /// Everything this adapter was told once and then relies on.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,15 +42,13 @@ pub struct Config {
     pub message_transmitter: Address,
     /// Ceiling on the fee Circle may take, as basis points of the amount being sent.
     ///
-    /// Zero is the right answer for a finalized transfer, which is what Hyperion defaults to:
-    /// Circle charges nothing for those. Raising it is how an operator opts into fast transfers,
-    /// and it has to be raised at the same time as `min_finality_threshold` is lowered, because
-    /// Circle refuses a fast transfer whose max fee is below its own minimum.
+    /// Finalized lanes do not use this budget. A fast lane must be explicitly configured and
+    /// requires a nonzero budget.
     pub max_fee_bps: u32,
-    /// How final the source chain has to be before Circle will attest.
+    /// Legacy configuration field retained for serialization compatibility. It remains at 2000;
+    /// the effective finality is stored per lane.
     ///
-    /// 2000 means "wait for real finality", which is the conservative default and the one that
-    /// costs nothing. Anything lower is a fast transfer and comes with a fee.
+    /// 2000 means "wait for real finality".
     pub min_finality_threshold: u32,
 }
 
@@ -38,4 +62,48 @@ pub struct DomainLink {
     pub domain: u32,
     /// Who may broadcast the resulting message on the far side. All zeroes means anybody.
     pub destination_caller: BytesN<32>,
+}
+
+/// A proposed peer messenger rotation on a remote domain awaiting the timelock delay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerMessengerRotation {
+    /// The new remote messenger address on the source domain.
+    pub new_messenger: BytesN<32>,
+    /// Timestamp at or after which `apply` may be called.
+    pub eta: u64,
+    /// Timestamp when the rotation was proposed.
+    pub queued_at: u64,
+}
+
+/// An active overlap acceptance window for historical messages from a retired peer messenger.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalMessengerWindow {
+    /// The retired remote messenger address.
+    pub old_messenger: BytesN<32>,
+    /// Timestamp until which historical messages from `old_messenger` are still accepted.
+    pub valid_until: u64,
+}
+
+/// A proposed local TokenMessenger rotation awaiting the timelock delay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessengerRotation {
+    /// The replacement TokenMessenger address proposed by the admin.
+    pub new_messenger: Address,
+    /// Timestamp at or after which `apply` may be called.
+    pub eta: u64,
+    /// Timestamp when the rotation was proposed.
+    pub queued_at: u64,
+}
+
+/// Historical window for retired local TokenMessenger.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalTokenMessengerWindow {
+    /// The retired local TokenMessenger address.
+    pub old_messenger: Address,
+    /// Timestamp until which messages naming `old_messenger` are still accepted.
+    pub valid_until: u64,
 }

@@ -24,6 +24,7 @@ import {
 } from "../src/abi/errors.js";
 import { ROUTE_KINDS, ROUTE_SLUGS, RouteKind } from "../src/routes.js";
 import { QuoteBlocker } from "../src/quotes.js";
+import { TokenMappingConflict } from "../src/tokenMapping.js";
 import { AddressKind } from "../src/addresses.js";
 import {
   BURN_MESSAGE_VERSION,
@@ -40,9 +41,49 @@ const packageRoot = resolve(here, "..");
 const evmRoot = resolve(packageRoot, "..", "..", "evm");
 const sorobanRoot = resolve(packageRoot, "..", "..", "soroban");
 const coreSrc = join(sorobanRoot, "crates", "hyperion-core", "src");
+const sorobanRouterSrc = join(sorobanRoot, "crates", "hyperion-router", "src");
+const sorobanCctpSrc = join(sorobanRoot, "crates", "hyperion-adapter-cctp", "src");
+const sorobanAxelarSrc = join(sorobanRoot, "crates", "hyperion-adapter-axelar", "src");
+const evmTest = join(evmRoot, "test");
 
 function read(path: string): string {
   return readFileSync(path, "utf8");
+}
+
+function bracedBlock(source: string, anchor: RegExp, label: string): string {
+  const match = anchor.exec(source);
+  expect(match, `${label} reference is missing`).not.toBeNull();
+  const open = source.indexOf("{", match!.index);
+  expect(open, `${label} body is missing`).toBeGreaterThan(-1);
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(match!.index, index + 1);
+      }
+    }
+  }
+  throw new Error(`${label} body is not closed`);
+}
+
+function rustFunction(source: string, name: string): string {
+  return bracedBlock(source, new RegExp(`\\bfn\\s+${name}\\s*\\(`), `Rust function ${name}`);
+}
+
+function solidityFunction(source: string, name: string): string {
+  return bracedBlock(
+    source,
+    new RegExp(`\\bfunction\\s+${name}\\s*\\(`),
+    `Solidity function ${name}`,
+  );
+}
+
+function requireEvidence(source: string, pattern: RegExp, label: string): void {
+  if (!pattern.test(source)) {
+    throw new Error(`${label} trust-surface evidence changed`);
+  }
 }
 
 /** Pull `Name = <n>,` out of a Rust enum body, in declaration order. */
@@ -63,6 +104,54 @@ function rustEnumVariants(source: string, enumName: string): { name: string; val
 /** Pull `error Name(` out of Solidity, in declaration order. */
 function solidityErrors(source: string): string[] {
   return [...source.matchAll(/^error\s+([A-Za-z0-9_]+)\s*\(/gm)].map((match) => match[1]!);
+}
+
+/**
+ * Pull the variant names out of a Rust enum that carries data, in declaration order.
+ *
+ * `rustEnumVariants` above wants `Name = <n>,` because Soroban's error enum is numbered by hand.
+ * A `contracttype` enum with tuple variants has no numbers to read, and its order is the wire
+ * order, so this reads names only and leaves the numbering to the shape of the enum itself.
+ */
+function rustDataEnumVariants(source: string, enumName: string): string[] {
+  const start = source.indexOf(`pub enum ${enumName}`);
+  expect(start, `${enumName} not found in the Rust source`).toBeGreaterThan(-1);
+  const open = source.indexOf("{", start);
+  const close = source.indexOf("\n}", open);
+  const body = source.slice(open + 1, close);
+  const out: string[] = [];
+  for (const match of body.matchAll(/^\s{4}([A-Z][A-Za-z0-9]*)\s*[({,]/gm)) {
+    out.push(match[1]!);
+  }
+  expect(out.length, `no variants parsed out of ${enumName}`).toBeGreaterThan(0);
+  return out;
+}
+
+/** Pull a Solidity struct's member names, in declaration order. */
+function solidityStructFields(source: string, structName: string): string[] {
+  const start = source.indexOf(`struct ${structName} {`);
+  expect(start, `${structName} not found in the Solidity source`).toBeGreaterThan(-1);
+  const close = source.indexOf("\n}", start);
+  const body = source.slice(start, close);
+  const out: string[] = [];
+  for (const match of body.matchAll(/^\s{4}[A-Za-z0-9_\[\]]+\s+([A-Za-z0-9_]+)\s*;/gm)) {
+    out.push(match[1]!);
+  }
+  return out;
+}
+
+/** Pull a TypeScript interface's property names, in declaration order. */
+function tsInterfaceFields(source: string, interfaceName: string): string[] {
+  const start = source.indexOf(`export interface ${interfaceName} {`);
+  expect(start, `${interfaceName} not found in the TypeScript source`).toBeGreaterThan(-1);
+  const close = source.indexOf("\n}", start);
+  const body = source.slice(start, close);
+  const out: string[] = [];
+  for (const match of body.matchAll(/^\s{2}readonly\s+([A-Za-z0-9_]+)\??\s*:/gm)) {
+    out.push(match[1]!);
+  }
+  expect(out.length, `no fields parsed out of ${interfaceName}`).toBeGreaterThan(0);
+  return out;
 }
 
 /** Pull a Solidity enum's members, in declaration order. */
@@ -166,6 +255,189 @@ describe("the address kinds", () => {
   });
 });
 
+describe("the documented inbound trust surface", () => {
+  it("keeps the active deployment gate and the interface references executable", () => {
+    const docs = read(join(coreSrc, "lib.rs"));
+    requireEvidence(
+      docs,
+      /active deployment is Stellar Testnet outbound ITS\/CCTP/i,
+      "active deployment gate",
+    );
+    requireEvidence(
+      docs,
+      /hyperion-adapter-cctp::rail::Receiver/,
+      "CCTP provider interface reference",
+    );
+    requireEvidence(docs, /inbound::Router/, "router inbound interface reference");
+    requireEvidence(docs, /packages\/protocol\/test\/parity\.test\.ts/, "trust check reference");
+    requireEvidence(
+      docs,
+      /do not execute through the\s+\/\/! router's timelock/,
+      "adapter authority distinction",
+    );
+    requireEvidence(
+      read(resolve(packageRoot, "..", "..", "script", "anvil-e2e.sh")),
+      /This local harness is not activation evidence/,
+      "local EVM harness activation gate",
+    );
+    const fixture = read(join(evmTest, "Fixture.sol"));
+    requireEvidence(
+      fixture,
+      /router\.adapter\(RouteKind\.Cctp\)/,
+      "fixture outbound adapter assertion",
+    );
+    requireEvidence(
+      fixture,
+      /router\.railReceiver\(RouteKind\.Cctp\)/,
+      "fixture inbound receiver assertion",
+    );
+
+    const routerInterface = bracedBlock(
+      read(join(coreSrc, "inbound.rs")),
+      /pub trait Router\s*\{/,
+      "Soroban inbound Router interface",
+    );
+    const methods = [...routerInterface.matchAll(/^\s*fn\s+([A-Za-z0-9_]+)\s*\(/gm)].map(
+      (item) => item[1],
+    );
+    expect(methods).toEqual(["is_paused", "bridge_in", "treasury"]);
+  });
+
+  it("binds inbound provider authentication to each active Soroban adapter", () => {
+    const cctpRail = read(join(sorobanCctpSrc, "rail.rs"));
+    const cctpReceiver = bracedBlock(
+      cctpRail,
+      /pub trait Receiver\s*\{/,
+      "CCTP Receiver interface",
+    );
+    requireEvidence(cctpReceiver, /fn receive_message\s*\(/, "CCTP transmitter call interface");
+
+    const cctpReceive = rustFunction(read(join(sorobanCctpSrc, "lib.rs")), "receive");
+    requireEvidence(cctpReceive, /relayer\.require_auth\(\)/, "CCTP relayer authentication");
+    requireEvidence(
+      cctpReceive,
+      /MessageTransmitterClient::new\(&env,\s*&cfg\.message_transmitter\)\.receive_message\(/,
+      "Circle message-transmitter authentication",
+    );
+
+    const axelarInbound = rustFunction(
+      read(join(sorobanAxelarSrc, "lib.rs")),
+      "execute_with_interchain_token",
+    );
+    requireEvidence(axelarInbound, /cfg\.its\.require_auth\(\)/, "ITS callback authentication");
+    requireEvidence(
+      axelarInbound,
+      /source_address\s*!=\s*peer/,
+      "configured Axelar remote-peer check",
+    );
+    requireEvidence(
+      axelarInbound,
+      /storage::token_of\(&env,\s*&token_id\)/,
+      "Axelar token mapping",
+    );
+
+    const bridgeIn = rustFunction(read(join(sorobanRouterSrc, "lib.rs")), "bridge_in");
+    requireEvidence(bridgeIn, /caller\.require_auth\(\)/, "router inbound caller authorization");
+    requireEvidence(
+      bridgeIn,
+      /storage::rail_receiver\(&env,\s*route\)/,
+      "configured rail receiver lookup",
+    );
+    requireEvidence(bridgeIn, /caller\s*!=\s*expected/, "router receiver equality check");
+  });
+
+  it("distinguishes direct adapter authority from router timelocks", () => {
+    for (const sourceRoot of [sorobanCctpSrc, sorobanAxelarSrc]) {
+      const source = read(join(sourceRoot, "lib.rs"));
+      requireEvidence(
+        rustFunction(source, "set_admin"),
+        /require_admin\(&env\)/,
+        "direct adapter admin setter",
+      );
+      requireEvidence(
+        rustFunction(source, "require_admin"),
+        /cfg\.admin\.require_auth\(\)/,
+        "adapter admin auth",
+      );
+    }
+    requireEvidence(
+      rustFunction(read(join(sorobanCctpSrc, "lib.rs")), "set_fee_policy"),
+      /require_admin\(&env\)/,
+      "CCTP direct policy setter",
+    );
+    requireEvidence(
+      rustFunction(read(join(sorobanAxelarSrc, "lib.rs")), "set_chain_enabled"),
+      /require_admin\(&env\)/,
+      "Axelar direct chain setter",
+    );
+
+    const router = read(join(sorobanRouterSrc, "lib.rs"));
+    requireEvidence(
+      rustFunction(router, "queue_action"),
+      /timelock::queue\(/,
+      "Soroban queue path",
+    );
+    requireEvidence(
+      rustFunction(router, "execute_action"),
+      /timelock::take_matured\(/,
+      "Soroban matured execution",
+    );
+
+    const cctpEvm = read(join(evmRoot, "src", "adapters", "CctpAdapter.sol"));
+    requireEvidence(
+      solidityFunction(cctpEvm, "setLane"),
+      /external\s+onlyOwner/,
+      "direct EVM adapter owner setter",
+    );
+    requireEvidence(
+      solidityFunction(cctpEvm, "dispatch"),
+      /msg\.sender\s*!=\s*ROUTER/,
+      "EVM adapter's immutable router authority",
+    );
+    const axelarEvm = read(join(evmRoot, "src", "adapters", "AxelarItsAdapter.sol"));
+    requireEvidence(
+      solidityFunction(axelarEvm, "setPeer"),
+      /external\s+onlyOwner/,
+      "direct ITS owner setter",
+    );
+    requireEvidence(
+      solidityFunction(axelarEvm, "dispatch"),
+      /msg\.sender\s*!=\s*ROUTER/,
+      "ITS adapter's immutable router authority",
+    );
+
+    const evmRouter = read(join(evmRoot, "src", "HyperionRouter.sol"));
+    requireEvidence(
+      solidityFunction(evmRouter, "queueAction"),
+      /onlyRole\(DEFAULT_ADMIN_ROLE\)/,
+      "EVM queue authority",
+    );
+    requireEvidence(
+      solidityFunction(evmRouter, "executeAction"),
+      /block\.timestamp\s*<\s*queued\.eta/,
+      "EVM timelock delay",
+    );
+    requireEvidence(
+      read(join(evmTest, "Fixture.sol")),
+      /target\.executeAction\(id\)/,
+      "EVM fixture timelock path",
+    );
+  });
+
+  it("fails closed when a local interface or trust check is absent", () => {
+    expect(() => {
+      requireEvidence(
+        "interface with no receiver",
+        /MessageTransmitter/,
+        "fixture provider interface",
+      );
+    }).toThrow("fixture provider interface trust-surface evidence changed");
+    expect(() => {
+      requireEvidence("function setLane() external", /onlyOwner/, "fixture authority setter");
+    }).toThrow("fixture authority setter trust-surface evidence changed");
+  });
+});
+
 describe("the stateful router reference model parity", () => {
   it("shares operation words across chains while conserving balances and fixed-recipient liabilities", () => {
     const root = resolve(evmRoot, "..");
@@ -208,6 +480,45 @@ describe("the quote blockers", () => {
       .sort(([, a], [, b]) => a - b)
       .map(([name]) => name);
     expect(mine).toEqual(members);
+  });
+});
+
+describe("the token registration diagnostics", () => {
+  it("matches the Solidity enum, in order, with None first", () => {
+    // These travel in a struct an app reads over `eth_call`, so a reordering would relabel every
+    // finding on the screen while leaving the shape valid.
+    const members = solidityEnum(
+      read(join(evmRoot, "src", "HyperionTypes.sol")),
+      "TokenMappingConflict",
+    );
+    const mine = Object.entries(TokenMappingConflict)
+      .sort(([, a], [, b]) => a - b)
+      .map(([name]) => name);
+    expect(mine).toEqual(members);
+  });
+
+  it("has the same report fields, in the same order, as the Solidity struct", () => {
+    // The report is read over `eth_call` and decoded by position, so a field added on one side
+    // and not the other does not fail the call: it silently shifts every field after it, and an
+    // app then renders one field's value under another field's name.
+    const solidity = solidityStructFields(
+      read(join(evmRoot, "src", "HyperionTypes.sol")),
+      "TokenMappingReport",
+    );
+    const typescript = tsInterfaceFields(
+      read(join(packageRoot, "src", "tokenMapping.ts")),
+      "TokenMappingReport",
+    );
+    expect(typescript).toEqual(solidity);
+  });
+
+  it("matches the Soroban enum, minus the None the Rust side does not need", () => {
+    // Soroban's `contracttype` needs no zero value, so its list starts at `TokenId`. Everything
+    // after that has to line up, because an operator reads one diagnostic and a keeper reads the
+    // other and they are describing the same fault.
+    const variants = rustDataEnumVariants(read(join(coreSrc, "axelar.rs")), "TokenMappingConflict");
+    const mine = Object.keys(TokenMappingConflict).filter((name) => name !== "None");
+    expect(mine).toEqual(variants);
   });
 });
 

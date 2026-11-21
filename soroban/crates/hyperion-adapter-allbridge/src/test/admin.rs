@@ -1,13 +1,15 @@
 //! Wiring, roles, the relay float, and the housekeeping anybody is allowed to do.
 
-use hyperion_core::{HyperionError, RouteKind};
+use hyperion_core::{HyperionError, RouteKind, STELLAR_DECIMALS};
 use soroban_sdk::{
     testutils::{Address as _, MockAuth, MockAuthInvoke},
     Address, BytesN, IntoVal, String,
 };
 
+use super::allbridge::{MockPool, MockPoolClient};
 use super::setup::{
-    World, BASE_CHAIN_ID, GAS_FLOAT, HUNDRED, NOWHERE_CHAIN_ID, POOL_FEE_BPS, RELAY_COST,
+    World, BASE_CHAIN_ID, ETH_CHAIN_ID, GAS_FLOAT, HUNDRED, NOWHERE_CHAIN_ID, POOL_FEE_BPS,
+    RELAY_COST,
 };
 use crate::{AllbridgeAdapter, AllbridgeAdapterClient};
 
@@ -75,6 +77,45 @@ fn the_wiring_is_only_ever_set_once() {
     assert_eq!(cfg.router, w.router_id);
     assert_eq!(cfg.bridge, w.bridge_id);
     assert_eq!(cfg.native, w.native_id);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn an_uninitialized_adapter_rejects_configuration_without_the_admin_signature() {
+    let w = World::new();
+    let id = w.env.register(AllbridgeAdapter, ());
+    let adapter = AllbridgeAdapterClient::new(&w.env, &id);
+    w.env.set_auths(&[]);
+
+    adapter.initialize(&w.relayer, &w.router_id, &w.bridge_id, &w.native_id);
+}
+
+#[test]
+fn the_configured_admin_can_authorize_the_initialization_rehearsal() {
+    let w = World::new();
+    let id = w.env.register(AllbridgeAdapter, ());
+    let adapter = AllbridgeAdapterClient::new(&w.env, &id);
+    w.env.mock_auths(&[MockAuth {
+        address: &w.admin,
+        invoke: &MockAuthInvoke {
+            contract: &id,
+            fn_name: "initialize",
+            args: (
+                w.admin.clone(),
+                w.router_id.clone(),
+                w.bridge_id.clone(),
+                w.native_id.clone(),
+            )
+                .into_val(&w.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    adapter.initialize(&w.admin, &w.router_id, &w.bridge_id, &w.native_id);
+
+    let cfg = adapter.get_config();
+    assert_eq!(cfg.admin, w.admin);
+    assert_eq!(cfg.router, w.router_id);
 }
 
 #[test]
@@ -154,17 +195,26 @@ fn a_chain_allbridge_has_no_bridge_for_cannot_be_linked() {
 }
 
 #[test]
-fn relinking_a_lane_moves_it_rather_than_stacking_a_second_one() {
+fn relinking_a_lane_cannot_quietly_repoint_a_live_one() {
     let w = World::new();
-    // Allbridge renumbers nothing, but Hyperion's own name for a chain can be repointed while
-    // a route is being retired. The forward direction is the one `dispatch` reads, so that is
-    // the one that has to follow.
-    w.adapter().link_chain(&w.ethereum(), &BASE_CHAIN_ID);
+    // A relink used to move the forward mapping while leaving the reverse one behind, which made
+    // two chain ids claim the same name. Revalidation is allowed; changing the answer is a
+    // migration and has to be refused rather than written as a side effect.
+    assert_eq!(
+        w.adapter().try_link_chain(&w.ethereum(), &BASE_CHAIN_ID),
+        Err(Ok(HyperionError::AlreadyConfigured))
+    );
     assert_eq!(
         w.adapter().get_lane(&w.ethereum()).allbridge_chain_id,
-        BASE_CHAIN_ID
+        super::setup::ETH_CHAIN_ID
     );
-    assert_eq!(w.adapter().chain_for(&BASE_CHAIN_ID), w.ethereum());
+    assert_eq!(
+        w.adapter().try_chain_for(&super::setup::BASE_CHAIN_ID),
+        Err(Ok(HyperionError::UnknownChain))
+    );
+    // The same answer again is harmless.
+    w.adapter()
+        .link_chain(&w.ethereum(), &super::setup::ETH_CHAIN_ID);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -216,6 +266,101 @@ fn a_receive_token_the_far_side_does_not_accept_cannot_be_mapped() {
             .try_link_asset(&w.token_id, &w.ethereum(), &w.unknown_receive_token()),
         Err(Ok(HyperionError::TokenNotMapped))
     );
+}
+
+#[test]
+fn a_pool_that_sells_another_token_cannot_be_mapped() {
+    let w = World::unlinked();
+    w.link_ethereum();
+    // Allbridge repointed this asset at a pool that sells a different local token. Both the
+    // bridge's record and the pool's own view now agree with each other, but they no longer
+    // describe the asset being mapped. That is a broken mapping, not a deployment to adopt.
+    let wrong = w.env.register(MockPool, ());
+    MockPoolClient::new(&w.env, &wrong).initialize(&w.bridge_id, &w.orphan_id, &POOL_FEE_BPS);
+    w.bridge().add_pool(&wrong, &w.orphan_id);
+    w.bridge().repoint_pool(&w.token_id, &wrong);
+    assert_eq!(
+        w.bridge().get_pool_address(&w.token_key(&w.token_id)),
+        wrong
+    );
+
+    assert_eq!(
+        w.adapter()
+            .try_link_asset(&w.token_id, &w.ethereum(), &w.receive_token()),
+        Err(Ok(HyperionError::TokenNotMapped))
+    );
+}
+
+#[test]
+fn a_precision_allbridge_did_not_register_cannot_be_mapped() {
+    let w = World::unlinked();
+    w.link_ethereum();
+    // The factor is derived from decimals when Allbridge adds the pool; a mismatch means the
+    // amounts coming back would be quoted at a precision nobody agreed to.
+    w.bridge().set_oracle_factor(&w.token_id, &1);
+
+    assert_eq!(
+        w.adapter()
+            .try_link_asset(&w.token_id, &w.ethereum(), &w.receive_token()),
+        Err(Ok(HyperionError::InvalidDecimals))
+    );
+}
+
+#[test]
+fn a_destination_word_that_is_not_an_evm_address_cannot_be_mapped() {
+    let w = World::unlinked();
+    w.link_ethereum();
+    let not_an_address = BytesN::from_array(&w.env, &[0x33; 32]);
+
+    assert_eq!(
+        w.adapter()
+            .try_link_asset(&w.token_id, &w.ethereum(), &not_an_address),
+        Err(Ok(HyperionError::NotEvmAddress))
+    );
+}
+
+#[test]
+fn revalidating_a_live_mapping_is_read_only() {
+    let w = World::new();
+    let link = w.adapter().get_asset(&w.token_id, &w.ethereum());
+    let admission = w.adapter().revalidate_asset(&w.token_id, &w.ethereum());
+    assert_eq!(admission.pool, w.pool_id);
+    assert_eq!(admission.decimals, STELLAR_DECIMALS);
+    assert_eq!(admission.allbridge_chain_id, ETH_CHAIN_ID);
+    assert_eq!(admission.receive_token, w.receive_token());
+
+    // Revalidation is allowed to fail loudly when the rail has drifted, but it must not repair
+    // the mapping by writing a new one behind the admin's back.
+    w.pool().set_pool_token(&w.orphan_id);
+    assert_eq!(
+        w.adapter().try_revalidate_asset(&w.token_id, &w.ethereum()),
+        Err(Ok(HyperionError::TokenNotMapped))
+    );
+    assert_eq!(w.adapter().get_asset(&w.token_id, &w.ethereum()), link);
+    assert_eq!(w.adapter().pool_for(&w.token_id), w.pool_id);
+}
+
+#[test]
+fn changing_a_live_asset_mapping_is_refused() {
+    let w = World::new();
+    let replacement = w.evm(0xA1);
+    // The far side does accept this word, so the only thing wrong with the call is that it tries
+    // to change an answer already published for this lane.
+    w.bridge().add_bridge_token(&ETH_CHAIN_ID, &replacement);
+    assert_eq!(
+        w.adapter()
+            .try_link_asset(&w.token_id, &w.ethereum(), &replacement),
+        Err(Ok(HyperionError::AlreadyConfigured))
+    );
+    assert_eq!(
+        w.adapter()
+            .get_asset(&w.token_id, &w.ethereum())
+            .receive_token,
+        w.receive_token()
+    );
+    // The same answer again stays a no-op.
+    w.adapter()
+        .link_asset(&w.token_id, &w.ethereum(), &w.receive_token());
 }
 
 #[test]
@@ -508,6 +653,6 @@ fn the_views_answer_with_allbridges_own_numbers() {
         &w.token_id,
         &POOL_FEE_BPS,
     );
-    w.bridge().add_pool(&moved, &w.token_key(&w.token_id));
+    w.bridge().add_pool(&moved, &w.token_id);
     assert_eq!(w.adapter().pool_for(&w.token_id), moved);
 }

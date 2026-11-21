@@ -57,7 +57,10 @@ mod test;
 
 use hyperion_core::{
     address::assert_route_supports,
-    cctp::{self, BurnMessage, CctpMessage, HyperionHook},
+    cctp::{
+        self, BurnMessage, CctpMessage, HyperionHook, DEFAULT_ROTATION_OVERLAP_WINDOW,
+        MIN_PEER_ROTATION_DELAY,
+    },
     codec,
     inbound::{Origin, Recipient, RouterClient},
     AdapterKeyCoverage, HyperionError, MaintenanceSummary, RouteKind, BPS_DENOMINATOR,
@@ -69,7 +72,11 @@ use soroban_sdk::{
 };
 
 use rail::{MessageTransmitterClient, TokenMessengerClient};
-use types::{Config, DomainLink};
+use types::{
+    Config, DomainLink, HistoricalMessengerWindow, HistoricalTokenMessengerWindow,
+    MessengerRotation, PeerMessengerRotation,
+};
+pub use types::{DispatchQuote, FinalityPolicy};
 
 /// Ceiling on `max_fee_bps`.
 ///
@@ -155,7 +162,7 @@ impl CctpAdapter {
         nonce: u64,
     ) -> Result<(), HyperionError> {
         caller.require_auth();
-        let (cfg, domain, _) = validate_dispatch(
+        let (cfg, domain, _, finality_threshold) = validate_dispatch(
             &env,
             &caller,
             amount,
@@ -164,11 +171,14 @@ impl CctpAdapter {
             None,
         )?;
 
-        let max_fee = amount
-            .checked_mul(i128::from(cfg.max_fee_bps))
-            .ok_or(HyperionError::DecimalOverflow)?
-            / BPS_DENOMINATOR;
-
+        let max_fee = if finality_threshold == cctp::FINALITY_THRESHOLD_FINALIZED {
+            0
+        } else {
+            amount
+                .checked_mul(i128::from(cfg.max_fee_bps))
+                .ok_or(HyperionError::DecimalOverflow)?
+                / BPS_DENOMINATOR
+        };
         let this = env.current_contract_address();
         let asset = token::Client::new(&env, &token);
         let allowance_before = open_approval(&env, &asset, &this, &cfg.token_messenger, amount)?;
@@ -181,7 +191,7 @@ impl CctpAdapter {
             &token,
             &storage::destination_caller(&env, domain),
             &max_fee,
-            &cfg.min_finality_threshold,
+            &finality_threshold,
         );
 
         close_approval(
@@ -199,7 +209,7 @@ impl CctpAdapter {
             amount,
             mint_recipient: destination,
             max_fee,
-            min_finality_threshold: cfg.min_finality_threshold,
+            min_finality_threshold: finality_threshold,
             router_nonce: nonce,
         }
         .publish(&env);
@@ -227,7 +237,7 @@ impl CctpAdapter {
     ) -> Result<(), HyperionError> {
         caller.require_auth();
         sender.require_auth();
-        let (cfg, domain, destination_caller) = validate_dispatch(
+        let (cfg, domain, destination_caller, finality_threshold) = validate_dispatch(
             &env,
             &caller,
             amount,
@@ -258,7 +268,7 @@ impl CctpAdapter {
             &token,
             &destination_caller,
             &gas_amount,
-            &cfg.min_finality_threshold,
+            &finality_threshold,
             &Bytes::from_array(&env, &hook),
         );
         close_approval(
@@ -275,7 +285,7 @@ impl CctpAdapter {
             amount,
             mint_recipient: destination,
             max_fee: gas_amount,
-            min_finality_threshold: cfg.min_finality_threshold,
+            min_finality_threshold: finality_threshold,
             router_nonce: nonce,
         }
         .publish(&env);
@@ -292,6 +302,13 @@ impl CctpAdapter {
     /// message alone is made first, then the transmitter mints, then the balance delta is
     /// measured rather than trusted, then the router pulls. If any step refuses, the whole
     /// transaction unwinds, Circle's nonce is left unused and the relayer can simply try again.
+    ///
+    /// # Historical-message handling and acceptance windows
+    ///
+    /// Messages from unauthorized peers never acquire inbound custody. When a messenger rotation
+    /// is applied, an explicit acceptance window permits in-flight historical messages from the
+    /// retired messenger to settle cleanly. Once the window expires, historical messages are
+    /// rejected with `OldMessengerExpired`. Emergency-disable controls halt custody immediately.
     pub fn receive(
         env: Env,
         relayer: Address,
@@ -309,11 +326,34 @@ impl CctpAdapter {
         if msg.destination_domain != cctp::STELLAR_DOMAIN {
             return Err(HyperionError::WrongDomain);
         }
-        // A burn message names Circle's own minter as its recipient. A message naming anything
-        // else is one this contract has no business reasoning about, so it does not get handed to
-        // the transmitter on the off chance that it works out.
-        if contract_at(&env, &msg.recipient) != cfg.token_messenger {
-            return Err(HyperionError::UnexpectedRailContract);
+
+        // Emergency disable check for the source domain
+        if storage::is_domain_disabled(&env, msg.source_domain) {
+            return Err(HyperionError::RouteDisabled);
+        }
+
+        // A burn message names Circle's own minter as its recipient.
+        // During an active overlap window after a rotation, the retired local messenger is also accepted.
+        let named_messenger = contract_at(&env, &msg.recipient);
+        if named_messenger != cfg.token_messenger {
+            let accepted_as_old = storage::old_token_messenger(&env)
+                .map(|old_window| {
+                    named_messenger == old_window.old_messenger
+                        && env.ledger().timestamp() <= old_window.valid_until
+                })
+                .unwrap_or(false);
+            if !accepted_as_old {
+                if storage::old_token_messenger(&env)
+                    .map(|old_window| {
+                        named_messenger == old_window.old_messenger
+                            && env.ledger().timestamp() > old_window.valid_until
+                    })
+                    .unwrap_or(false)
+                {
+                    return Err(HyperionError::OldMessengerExpired);
+                }
+                return Err(HyperionError::UnexpectedRailContract);
+            }
         }
 
         let body = CctpMessage::body(&message)?;
@@ -329,6 +369,31 @@ impl CctpAdapter {
             storage::chain_of(&env, msg.source_domain).ok_or(HyperionError::UnknownChain)?;
         let token = storage::asset(&env, msg.source_domain, &burn.burn_token)
             .ok_or(HyperionError::TokenNotMapped)?;
+
+        // Peer messenger validation on the source domain
+        if let Some(active_peer) = storage::peer_messenger(&env, msg.source_domain) {
+            let is_current = msg.sender == active_peer;
+            if !is_current {
+                let accepted_as_old = storage::old_peer_messenger(&env, msg.source_domain)
+                    .map(|old_window| {
+                        msg.sender == old_window.old_messenger
+                            && env.ledger().timestamp() <= old_window.valid_until
+                    })
+                    .unwrap_or(false);
+                if !accepted_as_old {
+                    if storage::old_peer_messenger(&env, msg.source_domain)
+                        .map(|old_window| {
+                            msg.sender == old_window.old_messenger
+                                && env.ledger().timestamp() > old_window.valid_until
+                        })
+                        .unwrap_or(false)
+                    {
+                        return Err(HyperionError::OldMessengerExpired);
+                    }
+                    return Err(HyperionError::UnexpectedRailContract);
+                }
+            }
+        }
 
         // Resolve the destination before anything is minted. A muxed account cannot be delivered
         // to over this route, and finding that out after the mint would mean funds sitting in an
@@ -516,7 +581,7 @@ impl CctpAdapter {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Administration
+    // Administration & Remote-Messenger Rotation Controls
     // ---------------------------------------------------------------------------------------
 
     /// Teach the adapter that a chain name and a Circle domain are the same place.
@@ -532,8 +597,6 @@ impl CctpAdapter {
             return Err(HyperionError::UnknownChain);
         }
         if domain == cctp::STELLAR_DOMAIN {
-            // Linking Stellar to itself would let an outbound transfer name the local domain,
-            // which Circle would refuse anyway. Refusing here keeps the reason legible.
             return Err(HyperionError::WrongDomain);
         }
         storage::set_link(&env, &chain, domain, &destination_caller);
@@ -567,11 +630,220 @@ impl CctpAdapter {
         Ok(())
     }
 
+    /// Emergency disable or re-enable routing on a configured domain.
+    pub fn set_domain_disabled(env: Env, domain: u32, disabled: bool) -> Result<(), HyperionError> {
+        require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        storage::set_domain_disabled(&env, domain, disabled);
+        events::DomainEnabled {
+            domain,
+            enabled: !disabled,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Set an authorized peer messenger on a remote domain directly.
+    pub fn set_peer_messenger(
+        env: Env,
+        domain: u32,
+        messenger: BytesN<32>,
+    ) -> Result<(), HyperionError> {
+        require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if messenger == zero {
+            return Err(HyperionError::ZeroAddressKey);
+        }
+        storage::set_peer_messenger(&env, domain, &messenger);
+        events::PeerRotationApplied {
+            domain,
+            old_peer: zero,
+            new_peer: messenger,
+            overlap_deadline: 0,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Propose a rotation of the authorized peer messenger on a remote domain.
+    pub fn propose_peer_rotation(
+        env: Env,
+        domain: u32,
+        new_peer: BytesN<32>,
+        delay: u64,
+    ) -> Result<(), HyperionError> {
+        require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if new_peer == zero {
+            return Err(HyperionError::ZeroAddressKey);
+        }
+        if let Some(current) = storage::peer_messenger(&env, domain) {
+            if current == new_peer {
+                return Err(HyperionError::MessengerUnchanged);
+            }
+        }
+        if storage::pending_peer_rotation(&env, domain).is_some() {
+            return Err(HyperionError::RotationAlreadyPending);
+        }
+        if delay < MIN_PEER_ROTATION_DELAY {
+            return Err(HyperionError::TimelockDelayOutOfRange);
+        }
+        let now = env.ledger().timestamp();
+        let eta = now
+            .checked_add(delay)
+            .ok_or(HyperionError::DecimalOverflow)?;
+        storage::set_pending_peer_rotation(
+            &env,
+            domain,
+            &PeerMessengerRotation {
+                new_messenger: new_peer.clone(),
+                eta,
+                queued_at: now,
+            },
+        );
+        events::PeerRotationQueued {
+            domain,
+            current_peer: storage::peer_messenger(&env, domain).unwrap_or(zero),
+            new_peer,
+            eta,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a previously proposed peer messenger rotation.
+    pub fn apply_peer_rotation(env: Env, domain: u32) -> Result<(), HyperionError> {
+        require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        let pending = storage::pending_peer_rotation(&env, domain)
+            .ok_or(HyperionError::RotationNotPending)?;
+        let now = env.ledger().timestamp();
+        if now < pending.eta {
+            return Err(HyperionError::RotationNotReady);
+        }
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        let old = storage::peer_messenger(&env, domain).unwrap_or(zero);
+        storage::set_peer_messenger(&env, domain, &pending.new_messenger);
+        storage::clear_pending_peer_rotation(&env, domain);
+        let deadline = now.saturating_add(DEFAULT_ROTATION_OVERLAP_WINDOW);
+        storage::set_old_peer_messenger(&env, domain, &old, deadline);
+        events::PeerRotationApplied {
+            domain,
+            old_peer: old,
+            new_peer: pending.new_messenger,
+            overlap_deadline: deadline,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancel a pending peer messenger rotation.
+    pub fn cancel_peer_rotation(env: Env, domain: u32) -> Result<(), HyperionError> {
+        require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        let pending = storage::pending_peer_rotation(&env, domain)
+            .ok_or(HyperionError::RotationNotPending)?;
+        storage::clear_pending_peer_rotation(&env, domain);
+        events::PeerRotationCancelled {
+            domain,
+            cancelled_peer: pending.new_messenger,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Propose replacing Circle's local TokenMessenger contract.
+    pub fn propose_messenger_rotation(
+        env: Env,
+        new_messenger: Address,
+        delay: u64,
+    ) -> Result<(), HyperionError> {
+        let cfg = require_admin(&env)?;
+        if new_messenger == cfg.token_messenger {
+            return Err(HyperionError::MessengerUnchanged);
+        }
+        if storage::pending_messenger_rotation(&env).is_some() {
+            return Err(HyperionError::RotationAlreadyPending);
+        }
+        if delay < MIN_PEER_ROTATION_DELAY {
+            return Err(HyperionError::TimelockDelayOutOfRange);
+        }
+        let now = env.ledger().timestamp();
+        let eta = now
+            .checked_add(delay)
+            .ok_or(HyperionError::DecimalOverflow)?;
+        storage::set_pending_messenger_rotation(
+            &env,
+            &MessengerRotation {
+                new_messenger: new_messenger.clone(),
+                eta,
+                queued_at: now,
+            },
+        );
+        events::MessengerRotationQueued {
+            current_messenger: cfg.token_messenger,
+            new_messenger,
+            eta,
+            queued_at: now,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a proposed local TokenMessenger rotation.
+    pub fn apply_messenger_rotation(env: Env) -> Result<(), HyperionError> {
+        let mut cfg = require_admin(&env)?;
+        let pending =
+            storage::pending_messenger_rotation(&env).ok_or(HyperionError::RotationNotPending)?;
+        let now = env.ledger().timestamp();
+        if now < pending.eta {
+            return Err(HyperionError::RotationNotReady);
+        }
+        let old = cfg.token_messenger.clone();
+        cfg.token_messenger = pending.new_messenger.clone();
+        storage::set_config(&env, &cfg);
+        storage::clear_pending_messenger_rotation(&env);
+        let deadline = now.saturating_add(DEFAULT_ROTATION_OVERLAP_WINDOW);
+        storage::set_old_token_messenger(&env, &old, deadline);
+        events::MessengerRotationApplied {
+            old_messenger: old,
+            new_messenger: pending.new_messenger,
+            overlap_deadline: deadline,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancel a pending local TokenMessenger rotation.
+    pub fn cancel_messenger_rotation(env: Env) -> Result<(), HyperionError> {
+        let cfg = require_admin(&env)?;
+        let pending =
+            storage::pending_messenger_rotation(&env).ok_or(HyperionError::RotationNotPending)?;
+        storage::clear_pending_messenger_rotation(&env);
+        events::MessengerRotationCancelled {
+            current_messenger: cfg.token_messenger,
+            cancelled_messenger: pending.new_messenger,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Change how much Circle may charge and how final the source has to be.
+    /// Set the maximum fee budget and retain the finalized-only legacy policy.
     ///
-    /// These two move together. A finality threshold below Circle's finalized value is a fast
-    /// transfer, and Circle refuses a fast transfer whose max fee is below its own minimum, so
-    /// lowering one without raising the other turns every dispatch on that lane into a refusal.
+    /// Fast finality is configured separately and explicitly for each linked lane.
     pub fn set_fee_policy(
         env: Env,
         max_fee_bps: u32,
@@ -581,17 +853,38 @@ impl CctpAdapter {
         if max_fee_bps > MAX_FEE_BPS_CEILING {
             return Err(HyperionError::FeeTooHigh);
         }
-        if min_finality_threshold == 0
-            || min_finality_threshold > cctp::FINALITY_THRESHOLD_FINALIZED
-        {
+        if min_finality_threshold != cctp::FINALITY_THRESHOLD_FINALIZED {
             return Err(HyperionError::InvalidLimit);
         }
         cfg.max_fee_bps = max_fee_bps;
-        cfg.min_finality_threshold = min_finality_threshold;
+        // Retain the legacy field at its safe value. Finality is selected per lane below.
+        cfg.min_finality_threshold = cctp::FINALITY_THRESHOLD_FINALIZED;
         storage::set_config(&env, &cfg);
         events::FeePolicySet {
             max_fee_bps,
             min_finality_threshold,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Explicitly select a supported finality level for a linked destination lane.
+    pub fn set_lane_finality_policy(
+        env: Env,
+        domain: u32,
+        policy: FinalityPolicy,
+    ) -> Result<(), HyperionError> {
+        let cfg = require_admin(&env)?;
+        if storage::chain_of(&env, domain).is_none() {
+            return Err(HyperionError::UnknownChain);
+        }
+        if policy == FinalityPolicy::Fast && cfg.max_fee_bps == 0 {
+            return Err(HyperionError::InvalidLimit);
+        }
+        storage::set_finality_policy(&env, domain, &policy);
+        events::LaneFinalityPolicySet {
+            domain,
+            min_finality_threshold: policy.threshold(),
         }
         .publish(&env);
         Ok(())
@@ -612,10 +905,6 @@ impl CctpAdapter {
     }
 
     /// Replace this contract's code.
-    ///
-    /// Gated on the adapter's own admin, which in production is the router's timelocked multisig.
-    /// An adapter is the one place in Hyperion that has to change when a rail changes, so being
-    /// able to upgrade it is the difference between shipping a fix and redeploying the world.
     pub fn upgrade(env: Env, wasm_hash: BytesN<32>) -> Result<(), HyperionError> {
         require_admin(&env)?;
         env.deployer()
@@ -640,6 +929,43 @@ impl CctpAdapter {
         })
     }
 
+    /// Report the effective fee and finality policy for a destination quote.
+    pub fn quote_dispatch(
+        env: Env,
+        chain: String,
+        amount: i128,
+    ) -> Result<DispatchQuote, HyperionError> {
+        if amount <= 0 {
+            return Err(HyperionError::InvalidAmount);
+        }
+        let cfg = storage::config(&env)?;
+        if cfg.max_fee_bps > MAX_FEE_BPS_CEILING {
+            return Err(HyperionError::FeeTooHigh);
+        }
+        let destination_domain =
+            storage::domain_of(&env, &chain).ok_or(HyperionError::UnknownChain)?;
+        let min_finality_threshold = storage::finality_policy(&env, destination_domain).threshold();
+        if min_finality_threshold == cctp::FINALITY_THRESHOLD_FAST && cfg.max_fee_bps == 0 {
+            return Err(HyperionError::InvalidLimit);
+        }
+        let max_fee = if min_finality_threshold == cctp::FINALITY_THRESHOLD_FINALIZED {
+            0
+        } else {
+            amount
+                .checked_mul(i128::from(cfg.max_fee_bps))
+                .ok_or(HyperionError::DecimalOverflow)?
+                / BPS_DENOMINATOR
+        };
+        if min_finality_threshold == cctp::FINALITY_THRESHOLD_FAST && max_fee == 0 {
+            return Err(HyperionError::InvalidLimit);
+        }
+        Ok(DispatchQuote {
+            destination_domain,
+            max_fee,
+            min_finality_threshold,
+        })
+    }
+
     pub fn domain_for(env: Env, chain: String) -> Result<u32, HyperionError> {
         storage::domain_of(&env, &chain).ok_or(HyperionError::UnknownChain)
     }
@@ -652,11 +978,55 @@ impl CctpAdapter {
         storage::asset(&env, domain, &burn_token).ok_or(HyperionError::TokenNotMapped)
     }
 
+    pub fn is_domain_disabled(env: Env, domain: u32) -> Result<bool, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::is_domain_disabled(&env, domain))
+    }
+
+    pub fn peer_messenger(env: Env, domain: u32) -> Result<Option<BytesN<32>>, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::peer_messenger(&env, domain))
+    }
+
+    pub fn pending_peer_rotation(
+        env: Env,
+        domain: u32,
+    ) -> Result<Option<PeerMessengerRotation>, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::pending_peer_rotation(&env, domain))
+    }
+
+    pub fn old_peer_messenger(
+        env: Env,
+        domain: u32,
+    ) -> Result<Option<HistoricalMessengerWindow>, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::old_peer_messenger(&env, domain))
+    }
+
+    pub fn pending_messenger_rotation(
+        env: Env,
+    ) -> Result<Option<MessengerRotation>, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::pending_messenger_rotation(&env))
+    }
+
+    pub fn old_token_messenger(
+        env: Env,
+    ) -> Result<Option<HistoricalTokenMessengerWindow>, HyperionError> {
+        let _ = storage::config(&env)?;
+        Ok(storage::old_token_messenger(&env))
+    }
+
     /// What Circle would be allowed to charge for a transfer of this size right now.
+    /// Generic fee-budget calculation. Prefer `quote_dispatch` for a lane-aware quote.
     pub fn quote_max_fee(env: Env, amount: i128) -> Result<i128, HyperionError> {
         let cfg = storage::config(&env)?;
         if amount <= 0 {
             return Err(HyperionError::InvalidAmount);
+        }
+        if cfg.max_fee_bps > MAX_FEE_BPS_CEILING {
+            return Err(HyperionError::FeeTooHigh);
         }
         Ok(amount
             .checked_mul(i128::from(cfg.max_fee_bps))
@@ -665,10 +1035,6 @@ impl CctpAdapter {
     }
 
     /// Read-only allowance auditor for the adapter and token messenger.
-    ///
-    /// Produces a versioned diagnostics snapshot (`ApprovalDiagnostics`).
-    /// Unexpected residual approvals produce findings without automatic mutation:
-    /// this function is strictly read-only and never modifies allowances or balances.
     pub fn audit_allowance(
         env: Env,
         token: Address,
@@ -799,11 +1165,6 @@ fn require_admin(env: &Env) -> Result<Config, HyperionError> {
 }
 
 /// Read a thirty two byte word as the Soroban contract it names.
-///
-/// CCTP fields have no room for a type tag, and every address this function is used on is one the
-/// protocol defines as a contract: the local minter named in a message, and the mint recipient
-/// Hyperion itself put there. Encoding it as a C strkey and letting the host parse it back is the
-/// cheapest way to compare it against an `Address` without inventing a second address format.
 fn contract_at(env: &Env, raw: &BytesN<32>) -> Address {
     Address::from_string(&codec::contract_strkey(env, &raw.to_array()))
 }
@@ -815,15 +1176,25 @@ fn validate_dispatch(
     chain: &String,
     destination: &BytesN<32>,
     gas_amount: Option<i128>,
-) -> Result<(Config, u32, BytesN<32>), HyperionError> {
+) -> Result<(Config, u32, BytesN<32>, u32), HyperionError> {
     let cfg = storage::config(env)?;
     if caller != &cfg.router {
         return Err(HyperionError::Unauthorized);
+    }
+    if cfg.max_fee_bps > MAX_FEE_BPS_CEILING {
+        return Err(HyperionError::FeeTooHigh);
     }
     if amount <= 0 || gas_amount.is_some_and(|gas| gas <= 0 || gas >= amount) {
         return Err(HyperionError::InvalidAmount);
     }
     let domain = storage::domain_of(env, chain).ok_or(HyperionError::UnknownChain)?;
+    if storage::is_domain_disabled(env, domain) {
+        return Err(HyperionError::RouteDisabled);
+    }
+    let finality_threshold = storage::finality_policy(env, domain).threshold();
+    if finality_threshold == cctp::FINALITY_THRESHOLD_FAST && cfg.max_fee_bps == 0 {
+        return Err(HyperionError::InvalidLimit);
+    }
     let zero = BytesN::from_array(env, &[0u8; 32]);
     if destination == &zero {
         return Err(HyperionError::InvalidDestination);
@@ -834,6 +1205,7 @@ fn validate_dispatch(
     }
     let max_fee = match gas_amount {
         Some(gas) => gas,
+        None if finality_threshold == cctp::FINALITY_THRESHOLD_FINALIZED => 0,
         None => {
             amount
                 .checked_mul(i128::from(cfg.max_fee_bps))
@@ -841,6 +1213,9 @@ fn validate_dispatch(
                 / BPS_DENOMINATOR
         }
     };
-    cctp::validate_burn_boundary(amount, destination, max_fee, cfg.min_finality_threshold)?;
-    Ok((cfg, domain, destination_caller))
+    if finality_threshold == cctp::FINALITY_THRESHOLD_FAST && max_fee == 0 {
+        return Err(HyperionError::InvalidLimit);
+    }
+    cctp::validate_burn_boundary(amount, destination, max_fee, finality_threshold)?;
+    Ok((cfg, domain, destination_caller, finality_threshold))
 }

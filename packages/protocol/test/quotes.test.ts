@@ -6,9 +6,12 @@ import {
   bestQuote,
   describeBlocker,
   minimumFromTolerance,
+  planForwardQuote,
+  planInverseQuote,
   planQuote,
   planQuoteV2,
   planQuotes,
+  quoteMinimumBatch,
   quoteBatch,
   quoteRoute,
   quoteAllRails,
@@ -299,6 +302,134 @@ describe("slippage, which the quote deliberately knows nothing about", () => {
     const quote = planQuote({ ...request, route: RouteKind.Cctp }, snapshot());
     expect(() => minimumFromTolerance(quote, -1)).toThrow(RangeError);
     expect(() => minimumFromTolerance(quote, 10_001)).toThrow(RangeError);
+  });
+});
+
+describe("destination minimum inversion", () => {
+  const forwardingBudget = {
+    destinationAmount: 123n,
+    unit: "destination-token-base-units",
+  } as const;
+  const inverseRequest = {
+    route: RouteKind.Cctp,
+    strkey: G_ADDR,
+    destinationDecimals: 7,
+    minimumDestinationAmount: 9_970_001n,
+    forwardingBudget,
+  } as const;
+
+  it("finds the least source amount that meets the recipient minimum after reserve", () => {
+    const inverse = planInverseQuote(inverseRequest, snapshot());
+    expect(inverse.available).toBe(true);
+    expect(inverse.requiredSourceAmount).not.toBeNull();
+    expect(inverse.forwardingBudget).toEqual(forwardingBudget);
+    expect(inverse.forwardingBudget.unit).toBe("destination-token-base-units");
+    expect(inverse.recipientDestinationAmount).toBeGreaterThanOrEqual(
+      inverse.minimumDestinationAmount,
+    );
+    expect(inverse.roundingOvershoot).toBeLessThanOrEqual(inverse.roundingBoundDestinationAmount);
+
+    const forward = planForwardQuote(
+      {
+        ...inverseRequest,
+        amount: inverse.requiredSourceAmount!,
+      },
+      snapshot(),
+    );
+    expect(forward.available).toBe(true);
+    expect(forward.meetsMinimum).toBe(true);
+    expect(forward.recipientDestinationAmount).toBe(inverse.recipientDestinationAmount);
+
+    const oneUnitLess = planForwardQuote(
+      {
+        ...inverseRequest,
+        amount: inverse.requiredSourceAmount! - 1n,
+      },
+      snapshot(),
+    );
+    expect(oneUnitLess.meetsMinimum).toBe(false);
+  });
+
+  it("returns actionable reasons for invalid assumptions and unattainable flow limits", () => {
+    const malformed = {
+      ...inverseRequest,
+      forwardingBudget: {
+        destinationAmount: -1n,
+        unit: "native-gas-units",
+      },
+    } as unknown as typeof inverseRequest;
+    expect(planInverseQuote(malformed, snapshot()).reason).toMatch(/forwarding budget/);
+
+    const overLimit = planInverseQuote(
+      { ...inverseRequest, minimumDestinationAmount: 9_970_001_000n },
+      snapshot({ flowAvailable: { [RouteKind.Cctp]: 500_000n } }),
+    );
+    expect(overLimit.available).toBe(false);
+    expect(overLimit.blocker).toBe(QuoteBlocker.FlowLimitExceeded);
+    expect(overLimit.reason).toMatch(/flow headroom/);
+  });
+
+  it("meets exact minima when source precision is reduced at the destination", () => {
+    const inverse = planInverseQuote(
+      {
+        ...inverseRequest,
+        destinationDecimals: 6,
+        minimumDestinationAmount: 1_000_001n,
+        forwardingBudget: { destinationAmount: 0n, unit: "destination-token-base-units" },
+      },
+      snapshot({ tokenDecimals: 7, feeBps: 0 }),
+    );
+    expect(inverse.available).toBe(true);
+    expect(inverse.recipientDestinationAmount).toBe(1_000_001n);
+    expect(inverse.roundingOvershoot).toBe(0n);
+    expect(inverse.roundingBoundDestinationAmount).toBe(0n);
+  });
+
+  it("honors the maximum quote integer without floating-point rounding", () => {
+    const maximumQuote = planQuote(
+      {
+        route: RouteKind.Cctp,
+        amount: MAX_QUOTE_AMOUNT,
+        strkey: G_ADDR,
+        destinationDecimals: 7,
+      },
+      snapshot({ flowAvailable: { [RouteKind.Cctp]: MAX_QUOTE_AMOUNT } }),
+    );
+    const boundary = planInverseQuote(
+      {
+        ...inverseRequest,
+        minimumDestinationAmount: maximumQuote.destinationAmount,
+        forwardingBudget: { destinationAmount: 0n, unit: "destination-token-base-units" },
+      },
+      snapshot({ flowAvailable: { [RouteKind.Cctp]: MAX_QUOTE_AMOUNT } }),
+    );
+    expect(boundary.available).toBe(true);
+    expect(boundary.requiredSourceAmount).toBeLessThanOrEqual(MAX_QUOTE_AMOUNT);
+    expect(boundary.quote?.destinationAmount).toBe(maximumQuote.destinationAmount);
+
+    const beyondBoundary = planInverseQuote(
+      {
+        ...inverseRequest,
+        minimumDestinationAmount: maximumQuote.destinationAmount + 1n,
+        forwardingBudget: { destinationAmount: 0n, unit: "destination-token-base-units" },
+      },
+      snapshot({ flowAvailable: { [RouteKind.Cctp]: MAX_QUOTE_AMOUNT } }),
+    );
+    expect(beyondBoundary.available).toBe(false);
+    expect(beyondBoundary.blocker).toBe(QuoteBlocker.NotRepresentable);
+  });
+
+  it("inverts each amount independently in a minimum ladder", () => {
+    const plans = quoteMinimumBatch([1_000n, 10_000n], {
+      route: RouteKind.Cctp,
+      strkey: G_ADDR,
+      destinationDecimals: 7,
+      forwardingBudget,
+      snapshot: snapshot(),
+    });
+    expect(plans).toHaveLength(2);
+    expect(plans.every((plan) => plan.available)).toBe(true);
+    expect(plans[0]!.requiredSourceAmount).toBeLessThan(plans[1]!.requiredSourceAmount!);
   });
 });
 

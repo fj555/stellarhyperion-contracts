@@ -16,8 +16,72 @@
 //! transfer in the app does, because it is the one value that appears on both sides of the hop,
 //! and it lets an indexer say *this delivery is that transfer* rather than guessing from amounts
 //! and timestamps.
+//!
+//! The other half of what Hyperion and Axelar have to agree on lives here too: the vocabulary for
+//! describing why a proposed token registration is incompatible with the one already on chain.
+//! Registration is an admin action taken once per asset, and the failure that matters is a second
+//! registration that quietly rewrites the first. [`TokenMappingConflict`] names the exact fields
+//! that disagree so the answer is a legible refusal rather than a mapping nobody can explain.
 
-use soroban_sdk::{contracttype, Bytes, BytesN, Env, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String, Vec};
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TokenManagerType {
+    NativeInterchainToken = 0,
+    MintBurnFrom = 1,
+    LockUnlock = 2,
+    MintBurn = 4,
+}
+
+impl TokenManagerType {
+    // Whether ITS takes funds by burning them out of the sender's balance.
+    //
+    // Three of the four do. Only `LockUnlock` moves the funds somewhere, which is the one case
+    // where the authorisation this adapter grants has to name a third party.
+    pub fn takes_by_burning(&self) -> bool {
+        !matches!(self, TokenManagerType::LockUnlock)
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestinationCapability {
+    DirectItsTransfer,
+    GmpPayload,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationCapabilityRecord {
+    pub chain: String,
+    pub axelar_chain: String,
+    pub peer: BytesN<20>,
+    pub token_id: BytesN<32>,
+    pub token_manager_type: TokenManagerType,
+    pub capability: DestinationCapability,
+}
+
+impl DestinationCapabilityRecord {
+    pub fn new(
+        chain: String,
+        axelar_chain: String,
+        peer: BytesN<20>,
+        token_id: BytesN<32>,
+        token_manager_type: TokenManagerType,
+        capability: DestinationCapability,
+    ) -> Self {
+        Self {
+            chain,
+            axelar_chain,
+            peer,
+            token_id,
+            token_manager_type,
+            capability,
+        }
+    }
+}
 
 use crate::error::HyperionError;
 use crate::strkey::StrkeyDestination;
@@ -327,10 +391,252 @@ fn read_nonce(raw: &Bytes, offset: u32) -> Result<u64, HyperionError> {
     Ok(value)
 }
 
+/// Authorized debit in a paid dispatch authorization tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedDebit {
+    pub contract: Address,
+    pub spender: Address,
+    pub amount: i128,
+}
+
+/// Authorization snapshot representing the authenticated debits of an Axelar paid dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaidDispatchAuthSnapshot {
+    /// The user account authenticating the debits.
+    pub sender: Address,
+    /// Principal bridge debit (burn or transfer to manager).
+    pub principal_token: Address,
+    pub principal_spender: Address,
+    pub principal_amount: i128,
+    pub is_burn: bool,
+    /// Fee debit paid to the treasury.
+    pub fee_token: Address,
+    pub fee_recipient: Address,
+    pub fee_amount: i128,
+    /// Gas debit paid to Axelar ITS / gas service.
+    pub gas_token: Address,
+    pub gas_recipient: Address,
+    pub gas_amount: i128,
+}
+
+/// Potential privilege expansions detected when inspecting an authorization tree against expectations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PrivilegeExpansion {
+    SenderMismatch,
+    ChangedPrincipalSpender,
+    ChangedGasRecipient,
+    ChangedFeeRecipient,
+    PrincipalAmountMismatch,
+    FeeAmountMismatch,
+    GasAmountMismatch,
+    UnexpectedBurnStatus,
+}
+
+/// Verify candidate paid dispatch authorization parameters against expected snapshot baseline.
+pub fn inspect_auth_tree_snapshot(
+    expected: &PaidDispatchAuthSnapshot,
+    candidate: &PaidDispatchAuthSnapshot,
+) -> Result<(), PrivilegeExpansion> {
+    if expected.sender != candidate.sender {
+        return Err(PrivilegeExpansion::SenderMismatch);
+    }
+    if expected.principal_token != candidate.principal_token {
+        return Err(PrivilegeExpansion::ChangedPrincipalSpender);
+    }
+    if expected.principal_spender != candidate.principal_spender {
+        return Err(PrivilegeExpansion::ChangedPrincipalSpender);
+    }
+    if expected.is_burn != candidate.is_burn {
+        return Err(PrivilegeExpansion::UnexpectedBurnStatus);
+    }
+    if expected.principal_amount != candidate.principal_amount {
+        return Err(PrivilegeExpansion::PrincipalAmountMismatch);
+    }
+    if expected.fee_token != candidate.fee_token {
+        return Err(PrivilegeExpansion::ChangedFeeRecipient);
+    }
+    if expected.fee_recipient != candidate.fee_recipient {
+        return Err(PrivilegeExpansion::ChangedFeeRecipient);
+    }
+    if expected.fee_amount != candidate.fee_amount {
+        return Err(PrivilegeExpansion::FeeAmountMismatch);
+    }
+    if expected.gas_token != candidate.gas_token {
+        return Err(PrivilegeExpansion::ChangedGasRecipient);
+    }
+    if expected.gas_recipient != candidate.gas_recipient {
+        return Err(PrivilegeExpansion::ChangedGasRecipient);
+    }
+    if expected.gas_amount != candidate.gas_amount {
+        return Err(PrivilegeExpansion::GasAmountMismatch);
+    }
+    Ok(())
+}
+
+/// One way a proposed token registration disagrees with what is already on chain.
+///
+/// Each variant names the field, not the symptom. "TokenNotMapped" tells an operator that
+/// something is wrong; `TokenId` with the value already stored and the value being proposed tells
+/// them which spreadsheet row to fix. The variants are deliberately one per field so a report can
+/// list several at once rather than stopping at the first.
+///
+/// The two `Unregistered*` variants exist because a conflict is not the only way a registration can
+/// fail. A token id Axelar has never heard of, or a local asset with no readable metadata, is a
+/// different mistake with a different fix, and folding it into "conflict" would send somebody
+/// looking for a second mapping that does not exist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenMappingConflict {
+    /// The local asset is already mapped to a different token id: (existing, proposed).
+    TokenId(BytesN<32>, BytesN<32>),
+    /// The token id is already mapped to a different local asset: (existing, proposed). This is
+    /// the direction that silently makes an inbound delivery pay the wrong token if it is allowed
+    /// to overwrite.
+    LocalToken(Address, Address),
+    /// The local asset reports different decimals than the registration expects:
+    /// (on chain, expected).
+    Decimals(u32, u32),
+    /// ITS takes funds for this token id through a different kind of token manager than the
+    /// registration expects: (on chain, expected). A `LockUnlock` manager holds a balance and
+    /// needs an authorisation naming a third party; the burning kinds do not, so getting this
+    /// wrong changes what the outbound path authorises as well as what the inbound path trusts.
+    ManagerType(u32, u32),
+    /// The local asset does not implement SEP-41 metadata this build can read.
+    UnreadableMetadata,
+    /// Axelar has no token manager, and so no registered asset, behind this token id.
+    UnregisteredTokenId,
+    /// Axelar's registered asset for this token id is a different contract than the one proposed:
+    /// (registered, proposed).
+    RailTokenMismatch(Address, Address),
+}
+
+/// What a registration check found, whether or not it found a problem.
+///
+/// Returned rather than only raised so a dry run can print the whole picture: which token id, which
+/// local asset, what Axelar says is registered behind it, which manager would move the funds, and
+/// every disagreement at once. A view that only threw on the first conflict would need as many calls
+/// as there are fields to answer the same question.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenMappingReport {
+    /// The local asset the caller proposed.
+    pub token: Address,
+    /// The token id the caller proposed.
+    pub token_id: BytesN<32>,
+    /// The token id already mapped to `token`, if any.
+    pub mapped_token_id: Option<BytesN<32>>,
+    /// The local asset already mapped to `token_id`, if any.
+    pub mapped_token: Option<Address>,
+    /// The asset Axelar's own registry reports for `token_id`, when it knows the id at all.
+    pub rail_token: Option<Address>,
+    /// The token manager Axelar would move funds through, when one is deployed.
+    pub rail_manager: Option<Address>,
+    /// How that manager takes the funds, as Axelar's own discriminant.
+    pub rail_manager_type: Option<u32>,
+    /// Decimals the local asset reports, when it implements readable SEP-41 metadata.
+    pub onchain_decimals: Option<u32>,
+    /// Decimals the caller said to expect, when they said.
+    pub expected_decimals: Option<u32>,
+    /// The manager kind the caller said to expect, when they said.
+    pub expected_manager_type: Option<u32>,
+    /// Every disagreement found, in a stable order. Empty means the mapping is compatible.
+    pub conflicts: Vec<TokenMappingConflict>,
+}
+
+impl TokenMappingReport {
+    /// A report with nothing observed yet and no conflicts.
+    pub fn new(env: &Env, token: Address, token_id: BytesN<32>) -> Self {
+        Self {
+            token,
+            token_id,
+            mapped_token_id: None,
+            mapped_token: None,
+            rail_token: None,
+            rail_manager: None,
+            rail_manager_type: None,
+            onchain_decimals: None,
+            expected_decimals: None,
+            expected_manager_type: None,
+            conflicts: Vec::new(env),
+        }
+    }
+
+    /// Whether this report describes a mapping that can be activated as it stands.
+    pub fn is_compatible(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+
+    /// Derive every disagreement from the observations already recorded on this report.
+    ///
+    /// Pure, and separated from the reads that populate it, because these are the rules both
+    /// chains have to agree on and they are worth testing without a mock rail behind them. The
+    /// order is fixed so two runs over the same facts print the same list, which is what makes a
+    /// diagnostic worth diffing between a rehearsal and production.
+    pub fn classify(&mut self, env: &Env) {
+        let mut conflicts = Vec::new(env);
+
+        // A mapping that would move an asset that is already mapped elsewhere is the one that
+        // silently changes where money goes. Both directions are checked, because they fail
+        // differently: the forward one breaks outbound dispatch, the reverse one makes an inbound
+        // delivery pay a token nobody registered.
+        if let Some(existing) = &self.mapped_token_id {
+            if existing != &self.token_id {
+                conflicts.push_back(TokenMappingConflict::TokenId(
+                    existing.clone(),
+                    self.token_id.clone(),
+                ));
+            }
+        }
+        if let Some(existing) = &self.mapped_token {
+            if existing != &self.token {
+                conflicts.push_back(TokenMappingConflict::LocalToken(
+                    existing.clone(),
+                    self.token.clone(),
+                ));
+            }
+        }
+
+        // What Axelar itself says is behind this id. Absent means ITS has no manager deployed for
+        // it, so there is nothing to route through and nothing to trust on the inbound leg.
+        match &self.rail_token {
+            None => conflicts.push_back(TokenMappingConflict::UnregisteredTokenId),
+            Some(registered) if registered != &self.token => {
+                conflicts.push_back(TokenMappingConflict::RailTokenMismatch(
+                    registered.clone(),
+                    self.token.clone(),
+                ));
+            }
+            Some(_) => {}
+        }
+
+        if let Some(expected) = self.expected_decimals {
+            match self.onchain_decimals {
+                None => conflicts.push_back(TokenMappingConflict::UnreadableMetadata),
+                Some(onchain) if onchain != expected => {
+                    conflicts.push_back(TokenMappingConflict::Decimals(onchain, expected));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(expected) = self.expected_manager_type {
+            match self.rail_manager_type {
+                None => conflicts.push_back(TokenMappingConflict::UnregisteredTokenId),
+                Some(onchain) if onchain != expected => {
+                    conflicts.push_back(TokenMappingConflict::ManagerType(onchain, expected));
+                }
+                Some(_) => {}
+            }
+        }
+
+        self.conflicts = conflicts;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::address::AddressKind;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Env, String};
 
     /// Real strkeys with real checksums, the same ones the strkey module is tested against.
@@ -523,6 +829,171 @@ mod tests {
         assert_eq!(NOTE_VERSION, crate::cctp::HOOK_VERSION);
     }
 
+    // -------------------------------------------------------------------------------------
+    // Registration conflict classification
+    // -------------------------------------------------------------------------------------
+
+    /// A report for an asset ITS knows about and backs with that same asset, which is the only
+    /// starting point from which "compatible" is a meaningful thing to assert.
+    fn report(env: &Env) -> TokenMappingReport {
+        let mut report = TokenMappingReport::new(
+            env,
+            Address::from_string(&String::from_str(
+                env,
+                "CAGR5KFYMZYI7WWQ6TWYYZ346T7GNZLKER4DOJTAG3SOB46QLR5RAPSN",
+            )),
+            BytesN::from_array(env, &[0x11; 32]),
+        );
+        report.rail_token = Some(report.token.clone());
+        report
+    }
+
+    /// A second real address, so a conflict between two of them is a conflict between two
+    /// checksums that both verify rather than one that was typed wrong.
+    fn other_address(env: &Env) -> Address {
+        Address::from_string(&String::from_str(env, G_ADDR))
+    }
+
+    #[test]
+    fn a_report_that_matches_the_rail_everywhere_is_compatible() {
+        let env = Env::default();
+        let mut report = report(&env);
+        report.classify(&env);
+        assert!(report.is_compatible(), "{:?}", report.conflicts);
+        assert_eq!(report.conflicts.len(), 0);
+    }
+
+    #[test]
+    fn an_id_axelar_does_not_back_is_a_conflict_even_with_nothing_else_observed() {
+        // A registration whose rail half cannot be read is not "compatible with no findings".
+        // There is nothing to route through, so it is the first thing worth saying.
+        let env = Env::default();
+        let mut report = TokenMappingReport::new(
+            &env,
+            Address::from_string(&String::from_str(
+                &env,
+                "CAGR5KFYMZYI7WWQ6TWYYZ346T7GNZLKER4DOJTAG3SOB46QLR5RAPSN",
+            )),
+            BytesN::from_array(&env, &[0x11; 32]),
+        );
+        report.classify(&env);
+        assert_eq!(
+            report.conflicts,
+            Vec::from_array(&env, [TokenMappingConflict::UnregisteredTokenId])
+        );
+    }
+
+    #[test]
+    fn a_mapping_that_reads_back_as_proposed_is_not_a_conflict() {
+        // The repeat case. Both stored values match what was asked for, so there is nothing to
+        // report and `map_token` can treat it as a no-op rather than a rewrite.
+        let env = Env::default();
+        let mut report = report(&env);
+        report.mapped_token_id = Some(report.token_id.clone());
+        report.mapped_token = Some(report.token.clone());
+        report.rail_token = Some(report.token.clone());
+        report.rail_manager_type = Some(4);
+        report.onchain_decimals = Some(7);
+        report.expected_decimals = Some(7);
+        report.expected_manager_type = Some(4);
+        report.classify(&env);
+        assert!(report.is_compatible(), "{:?}", report.conflicts);
+    }
+
+    #[test]
+    fn both_directions_of_a_token_conflict_are_named_with_both_values() {
+        let env = Env::default();
+        let mut report = report(&env);
+        let stranger = other_address(&env);
+        report.mapped_token_id = Some(BytesN::from_array(&env, &[0x22; 32]));
+        report.mapped_token = Some(stranger.clone());
+        report.rail_token = Some(report.token.clone());
+        report.classify(&env);
+        assert_eq!(
+            report.conflicts,
+            Vec::from_array(
+                &env,
+                [
+                    TokenMappingConflict::TokenId(
+                        BytesN::from_array(&env, &[0x22; 32]),
+                        BytesN::from_array(&env, &[0x11; 32]),
+                    ),
+                    TokenMappingConflict::LocalToken(stranger, report.token.clone()),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn an_unknown_token_id_and_a_mismatched_rail_token_are_distinguished() {
+        // Two different mistakes with two different fixes, so they get two different names. An
+        // operator told "conflict" for an id Axelar has never seen would go looking for a second
+        // mapping that does not exist.
+        let env = Env::default();
+        let mut unknown = report(&env);
+        unknown.rail_token = None;
+        unknown.classify(&env);
+        assert_eq!(
+            unknown.conflicts,
+            Vec::from_array(&env, [TokenMappingConflict::UnregisteredTokenId])
+        );
+
+        let mut mismatched = report(&env);
+        mismatched.rail_token = Some(other_address(&env));
+        mismatched.classify(&env);
+        assert_eq!(
+            mismatched.conflicts,
+            Vec::from_array(
+                &env,
+                [TokenMappingConflict::RailTokenMismatch(
+                    other_address(&env),
+                    mismatched.token.clone()
+                )]
+            )
+        );
+    }
+
+    #[test]
+    fn decimals_and_manager_kind_are_checked_only_when_the_caller_states_an_expectation() {
+        let env = Env::default();
+        // Observed but unjudged: an operator checking the ids should not have to guess at the
+        // other two fields to get a useful answer.
+        let mut observed = report(&env);
+        observed.onchain_decimals = Some(6);
+        observed.rail_manager_type = Some(2);
+        observed.classify(&env);
+        assert!(observed.is_compatible(), "{:?}", observed.conflicts);
+
+        let mut judged = report(&env);
+        judged.onchain_decimals = Some(6);
+        judged.rail_manager_type = Some(2);
+        judged.expected_decimals = Some(7);
+        judged.expected_manager_type = Some(4);
+        judged.classify(&env);
+        assert_eq!(
+            judged.conflicts,
+            Vec::from_array(
+                &env,
+                [
+                    TokenMappingConflict::Decimals(6, 7),
+                    TokenMappingConflict::ManagerType(2, 4),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn unreadable_metadata_is_its_own_finding_rather_than_a_decimals_mismatch() {
+        let env = Env::default();
+        let mut report = report(&env);
+        report.expected_decimals = Some(7);
+        report.classify(&env);
+        assert_eq!(
+            report.conflicts,
+            Vec::from_array(&env, [TokenMappingConflict::UnreadableMetadata])
+        );
+    }
+
     #[test]
     fn outbound_reconciliation_verifies_on_exact_match() {
         let env = Env::default();
@@ -687,5 +1158,81 @@ mod tests {
     #[test]
     fn minimum_peer_rotation_delay_is_at_least_one_hour() {
         assert_eq!(MIN_PEER_ROTATION_DELAY, 3_600);
+    }
+
+    #[test]
+    fn auth_tree_snapshot_verifies_exact_match_and_detects_privilege_expansion() {
+        let env = Env::default();
+        let user = Address::generate(&env);
+        let token = Address::generate(&env);
+        let manager = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let gas_token = Address::generate(&env);
+        let its = Address::generate(&env);
+
+        let baseline = PaidDispatchAuthSnapshot {
+            sender: user.clone(),
+            principal_token: token.clone(),
+            principal_spender: manager.clone(),
+            principal_amount: 10_000_000,
+            is_burn: false,
+            fee_token: token.clone(),
+            fee_recipient: treasury.clone(),
+            fee_amount: 50_000,
+            gas_token: gas_token.clone(),
+            gas_recipient: its.clone(),
+            gas_amount: 1_000,
+        };
+
+        // Exact match passes
+        assert_eq!(inspect_auth_tree_snapshot(&baseline, &baseline), Ok(()));
+
+        // Changed sender
+        let mut candidate = baseline.clone();
+        candidate.sender = Address::generate(&env);
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::SenderMismatch)
+        );
+
+        // Changed principal spender
+        candidate = baseline.clone();
+        candidate.principal_spender = Address::generate(&env);
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::ChangedPrincipalSpender)
+        );
+
+        // Changed gas recipient
+        candidate = baseline.clone();
+        candidate.gas_recipient = Address::generate(&env);
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::ChangedGasRecipient)
+        );
+
+        // Changed fee recipient
+        candidate = baseline.clone();
+        candidate.fee_recipient = Address::generate(&env);
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::ChangedFeeRecipient)
+        );
+
+        // Principal amount expansion
+        candidate = baseline.clone();
+        candidate.principal_amount = 10_000_001;
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::PrincipalAmountMismatch)
+        );
+
+        // Gas amount expansion
+        candidate = baseline.clone();
+        candidate.gas_amount = 2_000;
+        assert_eq!(
+            inspect_auth_tree_snapshot(&baseline, &candidate),
+            Err(PrivilegeExpansion::GasAmountMismatch)
+        );
     }
 }

@@ -3,8 +3,8 @@
 use hyperion_core::{cctp, HyperionError};
 use soroban_sdk::{testutils::Address as _, Address, BytesN, String};
 
-use super::setup::{World, ETHEREUM_DOMAIN, ETH_USDC};
-use crate::{CctpAdapter, CctpAdapterClient};
+use super::setup::{World, ETHEREUM_DOMAIN, ETH_USDC, UNLINKED_DOMAIN};
+use crate::{CctpAdapter, CctpAdapterClient, FinalityPolicy};
 
 #[test]
 fn an_adapter_nobody_set_up_refuses_to_do_anything() {
@@ -206,10 +206,12 @@ fn a_fee_budget_above_the_ceiling_is_refused() {
     let w = World::new();
     // A hundred basis points is already far above anything Circle has ever charged. Anything past
     // it is a fat fingered config change, not a policy decision.
-    w.adapter().set_fee_policy(&100, &1000);
+    w.adapter()
+        .set_fee_policy(&100, &cctp::FINALITY_THRESHOLD_FINALIZED);
     assert_eq!(w.adapter().get_config().max_fee_bps, 100);
     assert_eq!(
-        w.adapter().try_set_fee_policy(&101, &1000),
+        w.adapter()
+            .try_set_fee_policy(&101, &cctp::FINALITY_THRESHOLD_FINALIZED),
         Err(Ok(HyperionError::FeeTooHigh))
     );
     // And the refusal left the old value alone.
@@ -219,19 +221,42 @@ fn a_fee_budget_above_the_ceiling_is_refused() {
 #[test]
 fn a_finality_threshold_outside_circles_range_is_refused() {
     let w = World::new();
-    for bad in [0u32, cctp::FINALITY_THRESHOLD_FINALIZED + 1, u32::MAX] {
+    for bad in [
+        0u32,
+        cctp::FINALITY_THRESHOLD_FAST,
+        cctp::FINALITY_THRESHOLD_FINALIZED + 1,
+        u32::MAX,
+    ] {
         assert_eq!(
             w.adapter().try_set_fee_policy(&0, &bad),
             Err(Ok(HyperionError::InvalidLimit))
         );
     }
-    // The two ends of the legal range both work.
-    w.adapter().set_fee_policy(&0, &1);
+    assert_eq!(
+        w.adapter()
+            .try_set_lane_finality_policy(&ETHEREUM_DOMAIN, &FinalityPolicy::Fast),
+        Err(Ok(HyperionError::InvalidLimit))
+    );
     w.adapter()
         .set_fee_policy(&0, &cctp::FINALITY_THRESHOLD_FINALIZED);
+    w.adapter()
+        .set_fee_policy(&5, &cctp::FINALITY_THRESHOLD_FINALIZED);
+    w.adapter()
+        .set_lane_finality_policy(&ETHEREUM_DOMAIN, &FinalityPolicy::Fast);
     assert_eq!(
-        w.adapter().get_config().min_finality_threshold,
-        cctp::FINALITY_THRESHOLD_FINALIZED
+        w.adapter()
+            .quote_dispatch(&w.ethereum(), &100_000)
+            .min_finality_threshold,
+        cctp::FINALITY_THRESHOLD_FAST
+    );
+    assert_eq!(
+        w.adapter().quote_dispatch(&w.ethereum(), &100_000).max_fee,
+        50
+    );
+    assert_eq!(
+        w.adapter()
+            .try_set_lane_finality_policy(&UNLINKED_DOMAIN, &FinalityPolicy::Fast),
+        Err(Ok(HyperionError::UnknownChain))
     );
 }
 
@@ -240,7 +265,8 @@ fn a_finality_threshold_outside_circles_range_is_refused() {
 fn nobody_but_the_admin_can_change_the_fee_policy() {
     let w = World::new();
     w.env.set_auths(&[]);
-    w.adapter().set_fee_policy(&100, &1000);
+    w.adapter()
+        .set_fee_policy(&100, &cctp::FINALITY_THRESHOLD_FINALIZED);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -257,7 +283,8 @@ fn handing_over_the_admin_role_takes_effect_at_once() {
     // No timelock on this one. The adapter's admin is the router's own timelocked multisig in
     // production, so the delay already happened on the way to making this call.
     w.env.mock_all_auths();
-    w.adapter().set_fee_policy(&1, &1000);
+    w.adapter()
+        .set_fee_policy(&1, &cctp::FINALITY_THRESHOLD_FINALIZED);
     assert_eq!(w.adapter().get_config().max_fee_bps, 1);
 }
 

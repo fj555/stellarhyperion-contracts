@@ -283,3 +283,45 @@ fn its_explanation_matches_adapter_destination_and_combined_debit_overflow() {
     assert_eq!(w.token().balance(&w.treasury), 0);
     assert_eq!(w.router().last_out_nonce(), 0);
 }
+
+#[test]
+fn paid_dispatch_auth_spec_returns_exact_offline_parameters_for_burning_and_locking() {
+    let w = World::new();
+    w.its().set_native(&w.lock_asset);
+
+    // 1. Burnable asset spec
+    let spec = w
+        .bare()
+        .paid_dispatch_auth_spec(&w.token_id, &HUNDRED, &w.ethereum(), &1000);
+    assert_eq!(spec.token, w.token_id);
+    assert_eq!(spec.amount, HUNDRED);
+    assert_eq!(spec.token_manager, w.token_id);
+    assert!(spec.takes_by_burning);
+    assert_eq!(spec.gas_token, w.lock_asset);
+    assert_eq!(spec.gas_recipient, w.its_id);
+    assert_eq!(spec.gas_amount, 1000);
+
+    // 2. Lockable asset spec
+    let lock_spec = w
+        .bare()
+        .paid_dispatch_auth_spec(&w.lock_asset, &HUNDRED, &w.ethereum(), &500);
+    assert_eq!(lock_spec.token, w.lock_asset);
+    assert_eq!(lock_spec.amount, HUNDRED);
+    assert_eq!(lock_spec.token_manager, w.manager_id);
+    assert!(!lock_spec.takes_by_burning);
+    assert_eq!(lock_spec.gas_token, w.lock_asset);
+    assert_eq!(lock_spec.gas_recipient, w.its_id);
+    assert_eq!(lock_spec.gas_amount, 500);
+
+    // 3. Invalid inputs
+    assert_eq!(
+        w.bare()
+            .try_paid_dispatch_auth_spec(&w.token_id, &0, &w.ethereum(), &1000),
+        Err(Ok(HyperionError::InvalidAmount))
+    );
+    assert_eq!(
+        w.bare()
+            .try_paid_dispatch_auth_spec(&w.token_id, &HUNDRED, &w.ethereum(), &0),
+        Err(Ok(HyperionError::InvalidAmount))
+    );
+}

@@ -34,6 +34,38 @@ fn settled(w: &World, nonce: u64) -> u64 {
 }
 
 #[test]
+fn shared_storage_access_preserves_existing_keys_and_checked_liabilities() {
+    let w = World::new();
+    w.env.as_contract(&w.router_id, || {
+        let key = DataKey::ClaimLiability(w.token_id.clone());
+        w.env.storage().instance().set(&key, &i128::MAX);
+        assert_eq!(
+            storage::increase_claim_liability(&w.env, &w.token_id, 1),
+            Err(HyperionError::InvalidAmount)
+        );
+        assert_eq!(storage::claim_liability(&w.env, &w.token_id), i128::MAX);
+        storage::decrease_claim_liability(&w.env, &w.token_id, i128::MAX).unwrap();
+        assert_eq!(
+            storage::decrease_claim_liability(&w.env, &w.token_id, 1),
+            Err(HyperionError::InvalidAmount)
+        );
+        assert_eq!(storage::claim_liability(&w.env, &w.token_id), 0);
+        storage::increase_claim_liability(&w.env, &w.token_id, 7).unwrap();
+        assert_eq!(w.env.storage().instance().get::<_, i128>(&key), Some(7));
+
+        w.env.storage().instance().set(&DataKey::OutNonce, &17u64);
+        w.env.storage().instance().set(&DataKey::ClaimSeq, &27u64);
+        w.env.storage().instance().set(&DataKey::QueueSeq, &37u64);
+        assert_eq!(storage::next_out_nonce(&w.env), 18);
+        assert_eq!(storage::next_claim_id(&w.env), 28);
+        assert_eq!(storage::next_queue_id(&w.env), 38);
+        assert_eq!(storage::out_nonce(&w.env), 18);
+        assert_eq!(storage::claim_count(&w.env), 28);
+        assert_eq!(storage::queue_count(&w.env), 38);
+    });
+}
+
+#[test]
 fn batch_settlement_records_true_age_and_archived_claim_cannot_repay_after_restoration() {
     let w = World::new();
     let id = parked(&w, 105);

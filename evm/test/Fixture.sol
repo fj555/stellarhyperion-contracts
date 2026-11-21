@@ -11,6 +11,9 @@ import {MockRailAdapter} from "./mocks/MockRailAdapter.sol";
 /// @title The world every router test starts from
 /// @notice One router, one token, one adapter per rail, and a set of real Stellar addresses.
 /// @dev Two things here are worth knowing before reading any test that inherits it.
+/// The test pins the router's configured outbound adapters separately from its inbound rail
+/// receiver. Provider authentication belongs to each rail adapter; the router trusts only the
+/// configured receiver address for the inbound pull.
 ///
 /// The strkeys are real. They carry genuine CRC16 checksums, and they were generated rather than
 /// typed, because a made up one fails the checksum and every test that touched it would fail for
@@ -94,6 +97,8 @@ contract Fixture is Test {
 
         _registerToken(address(usdc), USDC_DECIMALS, FLOW_LIMIT);
         _setRailReceiver(RouteKind.Cctp, railReceiver);
+        assertEq(router.adapter(RouteKind.Cctp), address(cctpRail));
+        assertEq(router.railReceiver(RouteKind.Cctp), railReceiver);
 
         usdc.mint(alice, 10_000_000e6);
         vm.prank(alice);

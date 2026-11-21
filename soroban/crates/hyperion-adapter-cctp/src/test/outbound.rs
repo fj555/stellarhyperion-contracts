@@ -9,6 +9,7 @@ use soroban_sdk::{
 };
 
 use super::setup::{net_of, World, ETHEREUM_DOMAIN, EVM_DECIMALS, HUNDRED};
+use crate::FinalityPolicy;
 
 /// A left-padded EVM word, which is the only shape the router will let through.
 fn evm(world: &World, last: u8) -> BytesN<32> {
@@ -36,6 +37,14 @@ fn request(world: &World, amount: i128) -> OutboundRequest {
 #[test]
 fn a_transfer_walks_from_the_router_through_the_adapter_into_circles_burn() {
     let w = World::new();
+
+    let quote = w.adapter().quote_dispatch(&w.ethereum(), &net_of(HUNDRED));
+    assert_eq!(quote.destination_domain, ETHEREUM_DOMAIN);
+    assert_eq!(
+        quote.min_finality_threshold,
+        hyperion_core::cctp::FINALITY_THRESHOLD_FINALIZED
+    );
+    assert_eq!(quote.max_fee, 0);
 
     w.router().bridge_out(&w.user, &request(&w, HUNDRED));
 
@@ -90,6 +99,10 @@ fn preview_and_dispatch_share_burn_boundary_for_invalid_stored_fee_policy() {
             &evm(&w, 0x11),
             &None,
         ),
+        Err(Ok(HyperionError::FeeTooHigh))
+    );
+    assert_eq!(
+        w.adapter().try_quote_dispatch(&w.ethereum(), &HUNDRED),
         Err(Ok(HyperionError::FeeTooHigh))
     );
     assert_eq!(
@@ -216,7 +229,10 @@ fn zero_and_negative_amounts_never_reach_circle() {
 fn a_fast_transfer_budgets_a_fee_and_a_finalised_one_does_not() {
     let w = World::new();
     // Five basis points, and a confidence level Circle reaches in seconds rather than minutes.
-    w.adapter().set_fee_policy(&5, &1000);
+    w.adapter()
+        .set_fee_policy(&5, &hyperion_core::cctp::FINALITY_THRESHOLD_FINALIZED);
+    w.adapter()
+        .set_lane_finality_policy(&ETHEREUM_DOMAIN, &FinalityPolicy::Fast);
 
     w.router().bridge_out(&w.user, &request(&w, HUNDRED));
     let net = net_of(HUNDRED);
@@ -232,11 +248,17 @@ fn a_fast_transfer_budgets_a_fee_and_a_finalised_one_does_not() {
 #[test]
 fn the_fee_budget_is_quoted_with_the_same_arithmetic_it_is_charged_with() {
     let w = World::new();
-    w.adapter().set_fee_policy(&7, &1000);
+    w.adapter()
+        .set_fee_policy(&7, &hyperion_core::cctp::FINALITY_THRESHOLD_FINALIZED);
+    w.adapter()
+        .set_lane_finality_policy(&ETHEREUM_DOMAIN, &FinalityPolicy::Fast);
     // A quote the app can show and a budget the contract sends have to be the same number, or the
     // worst case a user was promised is not the worst case they get.
-    for amount in [1i128, 999, HUNDRED, HUNDRED * 9] {
-        assert_eq!(w.adapter().quote_max_fee(&amount), amount * 7 / 10_000);
+    for amount in [1_429i128, 9_999, HUNDRED, HUNDRED * 9] {
+        assert_eq!(
+            w.adapter().quote_dispatch(&w.ethereum(), &amount).max_fee,
+            amount * 7 / 10_000
+        );
     }
     assert_eq!(
         w.adapter().try_quote_max_fee(&0),

@@ -7,6 +7,7 @@ import {
   isStellarAsset,
   pairExists,
   routesForPair,
+  validatedOutboundRoutesForPair,
 } from "../src/registry/assets.js";
 import {
   CIRCLE_FAUCET_URL,
@@ -118,6 +119,21 @@ describe("pairing the two ends of a hop", () => {
     const rails = routesForPair("stellar", "base", "USDC");
     expect(rails).toContain(RouteKind.Cctp);
     expect(rails).toContain(RouteKind.AxelarIts);
+  });
+
+  it("limits validated outbound rails to the independently exercised testnet pairs", () => {
+    expect(validatedOutboundRoutesForPair("stellar-testnet", "sepolia", "USDC")).toEqual([
+      RouteKind.Cctp,
+      RouteKind.AxelarIts,
+    ]);
+    expect(validatedOutboundRoutesForPair("stellar-testnet", "base-sepolia", "USDC")).toEqual([
+      RouteKind.Cctp,
+    ]);
+    expect(validatedOutboundRoutesForPair("stellar-testnet", "arc-testnet", "USDC")).toEqual([
+      RouteKind.Cctp,
+    ]);
+    expect(validatedOutboundRoutesForPair("stellar", "sepolia", "USDC")).toEqual([]);
+    expect(validatedOutboundRoutesForPair("stellar-testnet", "base", "USDC")).toEqual([]);
   });
 });
 

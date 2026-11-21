@@ -62,6 +62,13 @@ export const GENERATED_EVM_ERROR_NAMES = [
   "RefundFailed",
   "ProviderBudgetExceeded",
   "AdapterMethodUnavailable",
+  "RotationAlreadyPending",
+  "RotationNotPending",
+  "RotationNotReady",
+  "MessengerUnchanged",
+  "OldMessengerExpired",
+  "TopUpIntentNotFound",
+  "TopUpBindingMismatch",
 ] as const;
 
 /** Four byte selector to error, for every error the compiled contracts can actually revert with. */
@@ -86,6 +93,7 @@ export const EVM_ERROR_SELECTORS = {
   "0x5274afe7": { name: "SafeERC20FailedOperation", signature: "SafeERC20FailedOperation(address)" },
   "0x6027aab3": { name: "AdapterMethodUnavailable", signature: "AdapterMethodUnavailable()" },
   "0x6697b232": { name: "AccessControlBadConfirmation", signature: "AccessControlBadConfirmation()" },
+  "0x6f2bffac": { name: "TopUpBindingMismatch", signature: "TopUpBindingMismatch()" },
   "0x71c4efed": { name: "SlippageExceeded", signature: "SlippageExceeded(uint256,uint256)" },
   "0x72942d97": { name: "TimelockNotReady", signature: "TimelockNotReady(uint64)" },
   "0x768fade0": { name: "TimelockExpired", signature: "TimelockExpired(uint64)" },
@@ -105,6 +113,7 @@ export const EVM_ERROR_SELECTORS = {
   "0xcc3da7e0": { name: "TimelockDelayOutOfRange", signature: "TimelockDelayOutOfRange()" },
   "0xcd4e6167": { name: "FeeTooHigh", signature: "FeeTooHigh()" },
   "0xd25598a0": { name: "InvalidDecimals", signature: "InvalidDecimals()" },
+  "0xd74d2f15": { name: "TopUpIntentNotFound", signature: "TopUpIntentNotFound()" },
   "0xd7940766": { name: "RouteIsPaused", signature: "RouteIsPaused(uint8)" },
   "0xd92e233d": { name: "ZeroAddress", signature: "ZeroAddress()" },
   "0xd93c0665": { name: "EnforcedPause", signature: "EnforcedPause()" },

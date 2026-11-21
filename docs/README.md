@@ -1,6 +1,7 @@
 # Documents
 
-`architecture-v0.1.md` is the design this repository was built from, unedited.
+`architecture-v0.1.md` is the design this repository was built from. Its main body is kept unedited;
+implementation notes are appended as clearly marked addenda rather than rewritten into the design.
 
 It is kept here rather than summarised because the code refers back to it constantly, and because
 a design document rewritten to match what was built stops being useful for the thing a design

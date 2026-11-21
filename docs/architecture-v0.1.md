@@ -11,9 +11,9 @@
 
 ## 1. Executive Summary
 
-Hyperion is a non-custodial bridging and swap layer connecting Stellar to EVM-compatible networks. The core architectural bet — the one I'd make on any bridge started today — is this: **Hyperion does not invent its own cross-chain trust mechanism.** Nearly every large bridge exploit to date (Wormhole, Ronin, Nomad, Poly Network, Multichain) traces back to the same root cause: custom validator, signature, or message-verification logic that had a bug or got compromised. That problem is now solved well enough, by well-funded, independently audited teams, that re-solving it buys risk, not differentiation.
+Hyperion is a non-custodial routing layer connecting Stellar to other networks. The core architectural bet — the one I'd make on any bridge started today — is this: **Hyperion does not invent its own cross-chain trust mechanism.** Nearly every large bridge exploit to date (Wormhole, Ronin, Nomad, Poly Network, Multichain) traces back to the same root cause: custom validator, signature, or message-verification logic that had a bug or got compromised. That problem is now solved well enough, by well-funded, independently audited teams, that re-solving it buys risk, not differentiation.
 
-Instead, Hyperion is a **routing and aggregation layer** over interoperability rails that are already live, audited, and officially supported on Stellar as of 2026: Circle's CCTP, Axelar's GMP/ITS, LayerZero's V2 Soroban endpoint, and Allbridge Core, with NEAR Intents available as an optional swap-intent path. Hyperion's own code stays deliberately thin — a router contract per chain, an SDK that picks the right rail for a given asset and situation, and the off-chain plumbing to track transfer status. That's what keeps it auditable on a realistic timeline, and it's what makes it a credible Stellar Wave / GrantFox maintainer candidate rather than a research project that never ships.
+The current Stellar Testnet deployment has outbound Axelar ITS and Circle CCTP routes. Other adapters are not production-ready merely because their interfaces exist: Allbridge remains development-only, and EVM and other rail development stays gated until each implementation is independently validated. Hyperion's own code stays deliberately thin — a router contract per chain, an SDK that picks a validated rail for a given asset and situation, and the off-chain plumbing to track transfer status.
 
 ## 2. Design Philosophy: Why a Router, Not a Bridge
 
@@ -100,8 +100,41 @@ The Route Planner is the only place that "knows" about all four rails. Everythin
 | Native USDC, Stellar ⇄ any CCTP-connected chain | **Circle CCTP V2** (Stellar = domain 27) | Official Circle rail, zero-slippage burn-and-mint, no wrapped asset |
 | XLM or another Stellar-native asset needs a canonical EVM representation | **Axelar Interchain Token Service** | Canonical registration, decentralized validator security, built-in flow limits |
 | Arbitrary cross-chain instruction (e.g. "bridge and stake in one step") | **Axelar GMP** or **LayerZero OApp** | General message passing; pick per desired trust model — Axelar's PoS/amplifier validators vs. LayerZero's configurable DVN set |
-| Non-USDC stablecoin, or any asset where waiting on attestation is worse than pool slippage | **Allbridge Core** | Liquidity-pool based, no attestation wait, Quarkslab-audited, mature |
+| Non-USDC stablecoin, or any asset where waiting on attestation is worse than pool slippage | **Allbridge Core (development only; gated)** | Not eligible for activation until its configured-validator trust, pool liquidity, authorization and accounting assumptions are independently validated |
 | "I hold asset A anywhere, I want asset B on Stellar" | **NEAR Intents** | Solver network quotes/executes the swap directly into XLM or Stellar USDC |
+
+### Allbridge activation evidence gate
+
+Allbridge's Soroban adapter is not part of the active deployment. The live deployment remains
+Stellar Testnet outbound ITS/CCTP; Allbridge, EVM, and other rail development stays gated until
+the candidate lane has independently validated evidence. The read-only evaluator is
+`node script/stellar/check-allbridge-activation.mjs <candidate.json> --trusted-key <acceptor-public-key.pem> --acceptor-id <id>`.
+The Ed25519 public key and acceptor identity must be trusted out of band.
+
+The candidate manifest binds evidence for:
+
+- router/admin authorization and dispatch authority;
+- the local Allbridge pool and its token;
+- available pool liquidity as a positive exact `amountAtomic` decimal string (never a JSON number);
+- Allbridge's configured validator key, its authority, and its trust model; and
+- independent validation scoped to the exact `sourceNetwork:direction:destination` lane.
+
+Every evidence record must be marked `verified`, cite one or more references, name its verifier,
+and carry valid `checkedAt` and future `expiresAt` timestamps. Missing, expired, malformed, or
+development-only records block readiness. The complete candidate and evidence document must
+carry an Ed25519 signature from the externally trusted acceptor; its signature covers the
+canonical JSON document with only `signedAcceptance.signatureBase64` omitted. Canonical JSON
+recursively sorts object keys, preserves array order, and uses UTF-8 without whitespace. The
+independent-validation verifier must differ from the acceptance signer. See
+`script/stellar/check-allbridge-activation.mjs` for the precise manifest fields and validation
+rules.
+
+The report identifies Allbridge configured-validator trust separately from Circle CCTP and
+Axelar assurances. Circle or Axelar evidence cannot satisfy Allbridge validator evidence.
+`ready` means only that the submitted evidence is complete and signed; the command never enables
+a route, alters contract state, or submits a transaction. The gate does not change deployed
+contract storage, entrypoints, or wire formats, so it requires no on-chain migration. It is an
+off-chain review control and does not make existing deployments activation-ready.
 
 ## 6. Stellar-Side Contracts (Soroban)
 
@@ -245,7 +278,10 @@ This is the section to make everyone on the team read before writing a line of c
 
 ## 10. Security Model
 
-- **Inherited, not invented.** `bridge_in` only ever acts on a call from the underlying rail's own verifier — CCTP's MessageTransmitter, Axelar's Gateway after `validate_message`, LayerZero's EndpointV2 after DVN quorum, Allbridge's Messenger contract. If the call didn't come from the rail's own contract, the router rejects it.
+- **Deployment boundary.** The active Stellar Testnet outbound routes are Axelar ITS and Circle CCTP. Allbridge is a development-only adapter; do not install it as an active adapter/receiver or enable its route until its configured-validator trust model, native gas float accounting, replay protection, and recipient-bound claims have been independently validated. EVM deployments and other rail work remain similarly gated until validated.
+- **Allbridge initialization authority.** A fresh instance requires the configured `admin` address to authorize `initialize`; the deploying identity must therefore be the intended admin or an authorized contract account. Rehearse on a fresh local fixture: initialization without that identity's authorization must fail, initialization with only the intended admin authorization must succeed, and `get_config` must report the expected admin and router. On deployment, use the matching signing identity for `--source-account` and `--admin`, then read back and compare the configuration before proceeding.
+- **Allbridge compatibility and migration.** This authorization adds no argument, storage key, or wire-format change; exact integer amounts, authenticated rail dispatch, replay protection, and recipient-bound claims are unchanged. Existing initialized instances retain their stored configuration and cannot be reinitialized. A fresh instance now requires the admin signature at initialization. If an instance was initialized with the wrong admin or router, deploy a replacement and migrate routing/configuration through the normal router governance process; initialization is intentionally not a repair mechanism.
+- **Inherited, not invented.** `bridge_in` only ever acts on a call from the underlying rail's own verifier — CCTP's MessageTransmitter, Axelar's Gateway after `validate_message`, or LayerZero's EndpointV2 after DVN quorum. Allbridge's configured-validator signature path is a separate trust model and remains gated until independently validated; do not describe it as inherited Messenger authorization.
 - **Only finalized source-chain state is ever truth.** No route accepts a client-supplied claim of "I sent X" — every mint or release is gated on the rail's own attested, finalized proof. This sounds obvious until someone proposes an "instant" mode that trusts an API response instead of a proof. Don't build that mode.
 - **Minimal, pausable, timelocked admin surface.** `pause`, `setFlowLimit`, and any upgrade path sit behind a multisig with a timelock long enough to catch a compromised or careless signer before a change takes effect. `pause` stops new `bridge_out` calls; it must never block an already-attested `bridge_in` from completing — funds in flight should never get stuck because the switch was flipped.
 - **Flow limits per asset, per route.** Axelar's ITS already ships flow limits — reuse rather than reimplement, and mirror the concept at the Hyperion router level so one misbehaving route or one depegging asset can't drain everything else.
@@ -340,6 +376,59 @@ Both programs route contributors to repos that already do something real — nei
 - GrantFox — search for their current app; it syncs directly against GitHub
 - Official Stellar dev-agent skills — `github.com/stellar/stellar-dev-skill`
 - For grant-application support specifically, Stellar Nigeria's Builder's Circle community runs sessions on exactly this
+
+## Appendix C: Allbridge admission addendum (implementation note)
+
+This appendix records what the adapter actually enforces for Allbridge. It does not change the
+design above: the active deployment remains Stellar Testnet outbound ITS/CCTP, Allbridge stays a
+development-only rail, and EVM and other rails remain explicitly gated.
+
+### Authority model
+
+A lane is usable only when Allbridge's own views agree about it. Before a mapping is written and
+again before every dispatch or inbound delivery, the adapter reads:
+
+- `BridgeConfig.pools` and `get_pool_address(token)` for the local token key. Both must name the
+  same pool.
+- The pool's `get_bridge()` and `get_pool().token`; both must name this bridge and this token.
+- The token's own `decimals()`, the pool's recorded `decimals`, and the factors Allbridge derived
+  when it added the pool:
+  `from_gas_oracle_factor = 10^(18 - decimals)` and
+  `bridging_fee_conversion_factor = 10^(18 + 7 - decimals)`.
+  `ORACLE_PRECISION = 18` and `CHAIN_PRECISION = 7` are upstream constants (`common/shared`).
+- The far bridge's `get_another_bridge(chain).tokens[receive_token]`, after the receive word is
+  checked as a left-zero-padded EVM address.
+
+A disagreement is refused with an existing `HyperionError`; no new error numbers were introduced.
+
+### Compatibility and preserved behaviour
+
+- Integer amounts are still carried as `i128` at the router boundary and converted exactly once to
+  `u128` after the positive check. No rounding or rescale was added.
+- Dispatch is still callable only by the router. Admission runs before any sub-invocation is
+  authorised, so a wrong pool or precision cannot move user funds.
+- Inbound processing still verifies the validator signature and marks the message processed only
+  once; pool validation was inserted before the top-up and before the replay marker.
+- Claims remain bound to the signed recipient and nonce.
+- Muxed recipients remain refused: `assert_route_supports(Allbridge, MuxedAccount)` returns
+  `MuxedNotSupported` before a claim is opened. The 32-byte Allbridge recipient word has no room
+  for a muxed id.
+- No wire format, event, or storage key changed. The new `revalidate_asset` view is additive and
+  read-only.
+
+### Migration and operations
+
+- Existing correct lane and asset mappings keep working unchanged. Re-running `link_chain` or
+  `link_asset` with identical values is an idempotent no-op.
+- Re-running with different values now returns `AlreadyConfigured`; revalidation never silently
+  overwrites a live mapping. Repointing a lane or asset is a deliberate migration, not a side
+  effect of a health check.
+- If Allbridge repoints a token at another pool, changes a pool's asset or precision, or removes a
+  far-side receive token, outbound and inbound calls fail closed. A new mapping must be deployed
+  and reviewed rather than written through `revalidate_asset` or an opportunistic relink.
+- `revalidate_asset(token, chain)` lets an operator verify a mapping without changing it. It
+  returns the admitted pool, decimals, Allbridge chain id, and receive word, or the same error a
+  dispatch would return.
 
 ---
 

@@ -14,6 +14,10 @@
 //! replay attacks, ensures the local asset mapping is valid, pre-authorises the transfer to the router,
 //! and forwards the verified delivery to `router.bridge_in`.
 //!
+//! This is a configured-validator trust model: successful verification proves that the configured
+//! Allbridge key signed the message, not that Circle or Axelar independently attested to it.
+//! Deployment readiness is assessed off-chain; this contract does not implement an activation gate.
+//!
 //! One consequence worth stating plainly: `receive_amount_min`, the slippage guard, is chosen by
 //! whoever calls `receive_tokens` on the destination chain. Outbound from Stellar that is not
 //! Hyperion, and `swap_and_bridge` has no minimum of its own, so this contract cannot promise an
@@ -39,11 +43,21 @@
 //! destination chain's gas price. `sweep` refuses to touch the native asset, so the float cannot
 //! be tidied away by a well meaning keeper.
 //!
+//! # Token and pool admission
+//!
+//! A lane is not eligible just because it has a name and a chain id. Before an asset can be used
+//! on it, Allbridge's own views have to agree that the local token is the one behind its pool, that
+//! the pool belongs to this bridge, that the precision recorded in the pool and in Allbridge's
+//! conversion factors is the precision the token actually reports, and that the destination bridge
+//! accepts the token the mapping pays out in. The same checks run again at dispatch, so a rail-side
+//! change after configuration fails closed before any amount is authorised or sold.
+//!
 //! # What this contract does not do
 //!
-//! It holds no pool, quotes no price, and trusts Allbridge's own numbers for the pool address, the
-//! relay cost and the rebalancer. Every one of those is read at the moment it is used rather than
-//! written down here, so there is nothing to keep in step.
+//! It holds no pool and quotes no price. The relay cost and the rebalancer are still read live at
+//! the moment they are used. Pool identity and precision are the exception: they are checked on
+//! every use rather than cached, but a disagreement stops the transfer instead of being followed
+//! blindly. The validator key and the native gas float keep their existing authority.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -82,8 +96,9 @@ pub struct AllbridgeAdapter;
 impl AllbridgeAdapter {
     /// Wire the adapter up.
     ///
-    /// Starts with no lane and no asset, so a deploy script that stops halfway leaves something
-    /// that refuses every transfer rather than something that guesses.
+    /// The configured administrator must authorize this one-time transition. Starts with no lane
+    /// and no asset, so a deploy script that stops halfway leaves something that refuses every
+    /// transfer rather than something that guesses.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -94,6 +109,7 @@ impl AllbridgeAdapter {
         if storage::is_initialized(&env) {
             return Err(HyperionError::AlreadyInitialized);
         }
+        admin.require_auth();
         storage::set_config(
             &env,
             &Config {
@@ -138,17 +154,26 @@ impl AllbridgeAdapter {
 
         // Allbridge wants the recipient as thirty two bytes and will take any thirty two bytes
         // it is given. Checking here means a mistyped destination comes back as a Hyperion
-        // refusal instead of arriving somewhere unrecoverable.
+        // refusal instead of arriving somewhere unrecoverable. A muxed account does not fit in
+        // this field either, so it fails the same EVM word check.
         let _ = bytes32_to_evm(&env, &destination)?;
 
         let this = env.current_contract_address();
         let bridge = AllbridgeBridgeClient::new(&env, &cfg.bridge);
         let bridge_cfg = bridge.get_config();
 
-        // Read live. The pool for an asset can be repointed by Allbridge's admin, and a stale
-        // copy here would authorise a transfer to the wrong contract.
-        let token_key = codec::contract_key(&env, &token)?;
-        let pool = bridge.get_pool_address(&BytesN::from_array(&env, &token_key));
+        // Admission is checked before any authorisation is granted. A pool repointed at a
+        // different token, a changed precision or a removed destination token stops here, with
+        // the funds still in this contract and nothing sold.
+        let admission = rail::validate_asset_admission(
+            &env,
+            &cfg.bridge,
+            &bridge_cfg,
+            &token,
+            lane.allbridge_chain_id,
+            &link.receive_token,
+        )?;
+        let pool = admission.pool;
 
         // The relay is billed in two pieces and the bridge checks the sum, so both have to be
         // asked for. Neither is stored.
@@ -263,6 +288,12 @@ impl AllbridgeAdapter {
 
         let (kind, recipient_key) = codec::address_key(&env, &recipient)?;
         assert_route_supports(RouteKind::Allbridge, kind)?;
+
+        // The same pool and precision authority used outbound applies to a delivery. It is
+        // checked before the caller is asked for any shortfall and before the message is marked
+        // processed, so a bad mapping cannot consume a nonce or strand a top-up.
+        let bridge_cfg = AllbridgeBridgeClient::new(&env, &cfg.bridge).get_config();
+        let _admission = rail::validate_pool(&env, &cfg.bridge, &bridge_cfg, &token)?;
 
         let amount_u128 = u128::try_from(amount).map_err(|_| HyperionError::InvalidAmount)?;
         let recipient_bytes = BytesN::from_array(&env, &recipient_key);
@@ -612,7 +643,7 @@ impl AllbridgeAdapter {
             chain,
             allbridge_chain_id,
         };
-        storage::set_lane(&env, &lane);
+        storage::set_lane(&env, &lane)?;
         events::LaneSet {
             chain: lane.chain,
             allbridge_chain_id: lane.allbridge_chain_id,
@@ -623,9 +654,9 @@ impl AllbridgeAdapter {
 
     /// Say which token a local asset becomes at the far end of a lane.
     ///
-    /// Both halves are checked: Allbridge has to hold a pool for the local asset, and the
-    /// destination bridge has to accept the token being named. Getting either wrong produces a
-    /// transfer that sells into a pool and then reverts on delivery.
+    /// The mapping is admitted only when Allbridge's own views agree about the local pool and its
+    /// precision, and the far bridge accepts the destination token. Re-running this with the same
+    /// answer is a no-op; changing a live answer is refused rather than written over.
     pub fn link_asset(
         env: Env,
         token: Address,
@@ -634,28 +665,22 @@ impl AllbridgeAdapter {
     ) -> Result<(), HyperionError> {
         let cfg = require_admin(&env)?;
         let lane = storage::lane(&env, &chain).ok_or(HyperionError::UnknownChain)?;
-        let bridge = AllbridgeBridgeClient::new(&env, &cfg.bridge);
-
-        let token_key = codec::contract_key(&env, &token)?;
-        bridge
-            .try_get_pool_address(&BytesN::from_array(&env, &token_key))
-            .map_err(|_| HyperionError::TokenNotMapped)?
-            .map_err(|_| HyperionError::TokenNotMapped)?;
-
-        let remote = bridge
-            .try_get_another_bridge(&lane.allbridge_chain_id)
-            .map_err(|_| HyperionError::UnknownChain)?
-            .map_err(|_| HyperionError::UnknownChain)?;
-        if remote.tokens.get(receive_token.clone()) != Some(true) {
-            return Err(HyperionError::TokenNotMapped);
-        }
+        let bridge_cfg = AllbridgeBridgeClient::new(&env, &cfg.bridge).get_config();
+        let _admission = rail::validate_asset_admission(
+            &env,
+            &cfg.bridge,
+            &bridge_cfg,
+            &token,
+            lane.allbridge_chain_id,
+            &receive_token,
+        )?;
 
         let link = AssetLink {
             token,
             allbridge_chain_id: lane.allbridge_chain_id,
             receive_token,
         };
-        storage::set_asset(&env, &link);
+        storage::set_asset(&env, &link)?;
         events::AssetLinked {
             token: link.token,
             allbridge_chain_id: link.allbridge_chain_id,
@@ -725,6 +750,31 @@ impl AllbridgeAdapter {
     pub fn get_asset(env: Env, token: Address, chain: String) -> Result<AssetLink, HyperionError> {
         let lane = storage::lane(&env, &chain).ok_or(HyperionError::UnknownChain)?;
         storage::asset(&env, &token, lane.allbridge_chain_id).ok_or(HyperionError::TokenNotMapped)
+    }
+
+    /// Re-run every admission check for a stored mapping without changing it.
+    ///
+    /// This is the preflight an operator or route planner calls after a rail-side change. It reads
+    /// Allbridge live and returns the pool and precision that would be used; it never writes a
+    /// mapping, so a revalidation cannot quietly repoint a live lane.
+    pub fn revalidate_asset(
+        env: Env,
+        token: Address,
+        chain: String,
+    ) -> Result<rail::AssetAdmission, HyperionError> {
+        let cfg = storage::config(&env)?;
+        let lane = storage::lane(&env, &chain).ok_or(HyperionError::UnknownChain)?;
+        let link = storage::asset(&env, &token, lane.allbridge_chain_id)
+            .ok_or(HyperionError::TokenNotMapped)?;
+        let bridge_cfg = AllbridgeBridgeClient::new(&env, &cfg.bridge).get_config();
+        rail::validate_asset_admission(
+            &env,
+            &cfg.bridge,
+            &bridge_cfg,
+            &token,
+            lane.allbridge_chain_id,
+            &link.receive_token,
+        )
     }
 
     /// The pool Allbridge currently holds this asset in, read live.

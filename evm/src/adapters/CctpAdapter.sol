@@ -8,9 +8,13 @@ import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 
 import {
     AlreadyConfigured,
+    DecimalOverflow,
     InvalidAmount,
     RailNotConfigured,
     RefundFailed,
+    TimelockDelayOutOfRange,
+    TimelockNotQueued,
+    TimelockNotReady,
     TokenNotMapped,
     Unauthorized,
     UnknownChain,
@@ -131,7 +135,28 @@ contract CctpAdapter is IRailAdapter, Ownable2Step {
         bool enabled;
     }
 
+    /// @notice Minimum delay before a proposed peer rotation can become active (1 hour).
+    uint64 public constant MIN_ROTATION_DELAY = 1 hours;
+
+    /// @notice Default overlap acceptance window for historical in-flight messages (24 hours).
+    uint64 public constant DEFAULT_OVERLAP_WINDOW = 1 days;
+
+    /// @notice A proposed peer rotation awaiting the timelock delay.
+    struct PeerRotation {
+        bytes32 newMintRecipient;
+        uint64 eta;
+        uint64 queuedAt;
+    }
+
+    /// @notice Historical peer window for retired peer messenger.
+    struct HistoricalPeer {
+        bytes32 oldMintRecipient;
+        uint64 validUntil;
+    }
+
     mapping(string chain => Lane lane) private _lanes;
+    mapping(string chain => PeerRotation) private _pendingRotations;
+    mapping(string chain => HistoricalPeer) private _historicalPeers;
 
     /// @notice A destination became reachable.
     event LaneConfigured(string chain, uint32 domain, bytes32 mintRecipient);
@@ -139,10 +164,22 @@ contract CctpAdapter is IRailAdapter, Ownable2Step {
     /// @notice A destination was turned on or off.
     event LaneEnabled(string chain, bool enabled);
 
+    /// @notice A peer messenger rotation was proposed.
+    event PeerRotationQueued(string indexed chain, bytes32 currentPeer, bytes32 newPeer, uint64 eta);
+
+    /// @notice A peer messenger rotation was applied.
+    event PeerRotationApplied(string indexed chain, bytes32 oldPeer, bytes32 newPeer, uint64 overlapDeadline);
+
+    /// @notice A peer messenger rotation was cancelled.
+    event PeerRotationCancelled(string indexed chain, bytes32 cancelledPeer);
+
     /// @notice A burn was handed to Circle.
     event BurnSubmitted(
         string chain, uint32 domain, uint256 amount, bytes32 mintRecipient, uint64 nonce, bytes hookData
     );
+
+    /// @notice Effective finality policy applied to a submitted burn.
+    event FinalityPolicyUsed(string chain, uint32 indexed domain, uint32 minFinalityThreshold);
 
     /// @notice Diagnostics announced for CCTP approval lifecycle during dispatch.
     event ApprovalAudited(
@@ -193,6 +230,15 @@ contract CctpAdapter is IRailAdapter, Ownable2Step {
         _dispatchPlan(token, amount, destination);
     }
 
+    /// @notice Quote the effective policy for a configured and enabled lane.
+    /// @dev This development adapter supports finalized transfers only.
+    function quoteFinalityPolicy(string calldata chain) external view returns (uint32) {
+        Lane storage lane = _lanes[chain];
+        if (!lane.configured) revert UnknownChain();
+        if (!lane.enabled) revert RailNotConfigured();
+        return FINALITY_THRESHOLD_FINALIZED;
+    }
+
     function _dispatchPlan(address token, uint256 amount, Destination calldata destination)
         private
         view
@@ -219,6 +265,7 @@ contract CctpAdapter is IRailAdapter, Ownable2Step {
         if (msg.sender != ROUTER) revert Unauthorized();
         (Lane memory lane, bytes memory hookData) = _dispatchPlan(token, amount, destination);
         emit BurnSubmitted(destination.chain, lane.domain, amount, lane.mintRecipient, nonce, hookData);
+        emit FinalityPolicyUsed(destination.chain, lane.domain, FINALITY_THRESHOLD_FINALIZED);
         uint256 allowanceBefore = IERC20(USDC).allowance(address(this), address(TOKEN_MESSENGER));
         IERC20(USDC).forceApprove(address(TOKEN_MESSENGER), amount);
         if (IERC20(USDC).allowance(address(this), address(TOKEN_MESSENGER)) != amount) {
@@ -284,6 +331,71 @@ contract CctpAdapter is IRailAdapter, Ownable2Step {
     /// @notice Read a configured destination.
     function laneOf(string calldata chain) external view returns (Lane memory) {
         return _lanes[chain];
+    }
+
+    /// @notice Propose a rotation of the peer messenger / mint recipient on a remote chain.
+    /// @param chain The Hyperion chain name.
+    /// @param newPeer The new peer mint recipient address (bytes32).
+    /// @param delay Timelock delay in seconds (must be >= MIN_ROTATION_DELAY).
+    function proposePeerRotation(string calldata chain, bytes32 newPeer, uint64 delay) external onlyOwner {
+        Lane storage lane = _lanes[chain];
+        if (!lane.configured) revert UnknownChain();
+        if (newPeer == bytes32(0)) revert ZeroAddress();
+        if (newPeer == lane.mintRecipient) revert AlreadyConfigured();
+        if (delay < MIN_ROTATION_DELAY) revert TimelockDelayOutOfRange();
+        if (_pendingRotations[chain].eta != 0) revert AlreadyConfigured();
+        if (block.timestamp > type(uint64).max - delay) revert DecimalOverflow();
+
+        uint64 nowTime = uint64(block.timestamp);
+        uint64 eta = nowTime + delay;
+        _pendingRotations[chain] = PeerRotation({newMintRecipient: newPeer, eta: eta, queuedAt: nowTime});
+
+        emit PeerRotationQueued(chain, lane.mintRecipient, newPeer, eta);
+    }
+
+    /// @notice Apply a previously proposed peer rotation after the delay has passed.
+    /// @param chain The Hyperion chain name.
+    function applyPeerRotation(string calldata chain) external onlyOwner {
+        Lane storage lane = _lanes[chain];
+        if (!lane.configured) revert UnknownChain();
+
+        PeerRotation memory rotation = _pendingRotations[chain];
+        if (rotation.eta == 0) revert TimelockNotQueued();
+        if (block.timestamp < rotation.eta) revert TimelockNotReady(rotation.eta);
+
+        bytes32 oldPeer = lane.mintRecipient;
+        lane.mintRecipient = rotation.newMintRecipient;
+        delete _pendingRotations[chain];
+
+        uint64 overlapDeadline = uint64(block.timestamp) + DEFAULT_OVERLAP_WINDOW;
+        _historicalPeers[chain] = HistoricalPeer({oldMintRecipient: oldPeer, validUntil: overlapDeadline});
+
+        emit PeerRotationApplied(chain, oldPeer, lane.mintRecipient, overlapDeadline);
+    }
+
+    /// @notice Cancel a pending peer rotation.
+    /// @param chain The Hyperion chain name.
+    function cancelPeerRotation(string calldata chain) external onlyOwner {
+        Lane storage lane = _lanes[chain];
+        if (!lane.configured) revert UnknownChain();
+
+        PeerRotation memory rotation = _pendingRotations[chain];
+        if (rotation.eta == 0) revert TimelockNotQueued();
+
+        bytes32 cancelled = rotation.newMintRecipient;
+        delete _pendingRotations[chain];
+
+        emit PeerRotationCancelled(chain, cancelled);
+    }
+
+    /// @notice Read the pending rotation for a chain.
+    function pendingRotationOf(string calldata chain) external view returns (PeerRotation memory) {
+        return _pendingRotations[chain];
+    }
+
+    /// @notice Read the historical peer window for a chain.
+    function historicalPeerOf(string calldata chain) external view returns (HistoricalPeer memory) {
+        return _historicalPeers[chain];
     }
 
     /// @notice Audits current allowance granted to the token messenger for USDC.

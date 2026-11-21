@@ -35,6 +35,17 @@ interface IInterchainTokenService {
     /// @param tokenId ITS's identifier for the token.
     /// @return The local ERC20, or the zero address when ITS has no record of that id here.
     function registeredTokenAddress(bytes32 tokenId) external view returns (address);
+
+    /// @notice The deployed manager for this token id.
+    /// @param tokenId ITS token identifier.
+    function tokenManagerAddress(bytes32 tokenId) external view returns (address);
+}
+
+/// @title Interchain token manager implementation identity
+/// @notice Reports the live manager type used for capability admission.
+interface IInterchainTokenManager {
+    /// @notice The ITS manager implementation discriminator (0 through 4).
+    function implementationType() external view returns (uint256);
 }
 
 /// @title What ITS calls on the receiving contract
@@ -75,4 +86,11 @@ interface IAxelarGasService {
     /// @param logIndex Which log within that transaction, since one transaction can start several.
     /// @param refundAddress Where anything left over goes once the delivery settles.
     function addNativeGas(bytes32 txHash, uint256 logIndex, address refundAddress) external payable;
+}
+
+/// @title Token manager diagnostics interface
+/// @notice Reports the implementation type for read-only mapping diagnostics.
+interface ITokenManager {
+    /// @notice The Axelar implementation discriminator.
+    function implementationType() external view returns (uint256);
 }

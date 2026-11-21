@@ -23,7 +23,7 @@ use soroban_sdk::{
     U256,
 };
 
-use crate::rail::{AnotherBridge, BridgeConfig};
+use crate::rail::{AnotherBridge, BridgeConfig, PoolState, CHAIN_PRECISION, ORACLE_PRECISION};
 
 /// Allbridge's own error numbers, in Allbridge's own order, for the refusals this adapter can
 /// provoke. Reproduced so a test can tell a refusal from the rail apart from one of Hyperion's.
@@ -63,12 +63,23 @@ pub struct SentRecord {
     pub message: BytesN<32>,
 }
 
+/// The bridge config's three maps, kept the way upstream keeps them so the adapter's admission
+/// checks read a fixture assembled by the same rules as the real thing.
+#[contracttype]
+#[derive(Clone)]
+struct RailConfig {
+    pools: Map<BytesN<32>, Address>,
+    from_gas_oracle_factor: Map<Address, u128>,
+    bridging_fee_conversion_factor: Map<Address, u128>,
+}
+
 #[contracttype]
 enum Key {
     Native,
     Messenger,
     Rebalancer,
     CanSwap,
+    Config,
     Pool(BytesN<32>),
     Remote(u32),
     Cost(u32),
@@ -94,12 +105,56 @@ impl MockBridge {
         s.set(&Key::Rebalancer, &rebalancer);
         s.set(&Key::CanSwap, &true);
         s.set(&Key::Count, &0u32);
+        s.set(
+            &Key::Config,
+            &RailConfig {
+                pools: Map::new(&env),
+                from_gas_oracle_factor: Map::new(&env),
+                bridging_fee_conversion_factor: Map::new(&env),
+            },
+        );
     }
 
     // -- test wiring -----------------------------------------------------------------------
 
-    pub fn add_pool(env: Env, pool: Address, token: BytesN<32>) {
-        env.storage().instance().set(&Key::Pool(token), &pool);
+    /// Upstream's `add_pool`: register the pool, then record the factors derived from the
+    /// token's own decimals. The adapter is only allowed to trust a pool whose record agrees
+    /// with these numbers.
+    pub fn add_pool(env: Env, pool: Address, token: Address) {
+        let s = env.storage().instance();
+        let token_key = token_bytes(&env, &token);
+        s.set(&Key::Pool(token_key.clone()), &pool);
+
+        let mut config: RailConfig = s.get(&Key::Config).expect("initialize the bridge first");
+        config.pools.set(token_key, pool);
+        let decimals = token::Client::new(&env, &token).decimals();
+        config
+            .from_gas_oracle_factor
+            .set(token.clone(), 10u128.pow(ORACLE_PRECISION - decimals));
+        config.bridging_fee_conversion_factor.set(
+            token,
+            10u128.pow(ORACLE_PRECISION + CHAIN_PRECISION - decimals),
+        );
+        s.set(&Key::Config, &config);
+    }
+
+    /// Point the bridge at a different pool without changing the pool's own record. Used for the
+    /// failure case where the two disagree.
+    pub fn repoint_pool(env: Env, token: Address, pool: Address) {
+        let s = env.storage().instance();
+        let token_key = token_bytes(&env, &token);
+        s.set(&Key::Pool(token_key.clone()), &pool);
+        let mut config: RailConfig = s.get(&Key::Config).unwrap();
+        config.pools.set(token_key, pool);
+        s.set(&Key::Config, &config);
+    }
+
+    /// Corrupt the factor Allbridge derived from the token's decimals.
+    pub fn set_oracle_factor(env: Env, token: Address, factor: u128) {
+        let s = env.storage().instance();
+        let mut config: RailConfig = s.get(&Key::Config).unwrap();
+        config.from_gas_oracle_factor.set(token, factor);
+        s.set(&Key::Config, &config);
     }
 
     pub fn register_bridge(env: Env, chain_id: u32, address: BytesN<32>) {
@@ -222,12 +277,13 @@ impl MockBridge {
 
     pub fn get_config(env: Env) -> BridgeConfig {
         let s = env.storage().instance();
+        let config: RailConfig = s.get(&Key::Config).unwrap();
         BridgeConfig {
             messenger: s.get(&Key::Messenger).unwrap(),
             rebalancer: s.get(&Key::Rebalancer).unwrap(),
-            from_gas_oracle_factor: Map::new(&env),
-            bridging_fee_conversion_factor: Map::new(&env),
-            pools: Map::new(&env),
+            from_gas_oracle_factor: config.from_gas_oracle_factor,
+            bridging_fee_conversion_factor: config.bridging_fee_conversion_factor,
+            pools: config.pools,
             can_swap: s.get(&Key::CanSwap).unwrap_or(false),
         }
     }
@@ -347,8 +403,7 @@ impl MockBridge {
 #[contracttype]
 enum PoolKey {
     Bridge,
-    Token,
-    FeeBps,
+    State,
     Sold,
 }
 
@@ -360,9 +415,52 @@ impl MockPool {
     pub fn initialize(env: Env, bridge: Address, asset: Address, fee_bps: u32) {
         let s = env.storage().instance();
         s.set(&PoolKey::Bridge, &bridge);
-        s.set(&PoolKey::Token, &asset);
-        s.set(&PoolKey::FeeBps, &fee_bps);
+        s.set(
+            &PoolKey::State,
+            &PoolState {
+                a: 20,
+                token: asset.clone(),
+                fee_share_bp: u128::from(fee_bps),
+                balance_ratio_min_bp: 0,
+                d: 0,
+                token_balance: 0,
+                v_usd_balance: 0,
+                reserves: 0,
+                decimals: token::Client::new(&env, &asset).decimals(),
+                total_lp_amount: 0,
+                admin_fee_share_bp: 0,
+                acc_reward_per_share_p: 0,
+                admin_fee_amount: 0,
+                can_deposit: true,
+                can_withdraw: true,
+            },
+        );
         s.set(&PoolKey::Sold, &0u128);
+    }
+
+    /// Change the asset the pool says it sells, without telling the bridge. An admission check
+    /// has to catch that before the bridge sends anything here.
+    pub fn set_pool_token(env: Env, token: Address) {
+        let s = env.storage().instance();
+        let mut state: PoolState = s.get(&PoolKey::State).unwrap();
+        state.token = token;
+        s.set(&PoolKey::State, &state);
+    }
+
+    pub fn set_pool_decimals(env: Env, decimals: u32) {
+        let s = env.storage().instance();
+        let mut state: PoolState = s.get(&PoolKey::State).unwrap();
+        state.decimals = decimals;
+        s.set(&PoolKey::State, &state);
+    }
+
+    /// Upstream's pool views, which are what admission reads.
+    pub fn get_pool(env: Env) -> PoolState {
+        env.storage().instance().get(&PoolKey::State).unwrap()
+    }
+
+    pub fn get_bridge(env: Env) -> Address {
+        env.storage().instance().get(&PoolKey::Bridge).unwrap()
     }
 
     /// Sell into the pool. Both the seller and the bridge have to have signed.
@@ -375,18 +473,17 @@ impl MockPool {
         let bridge: Address = s.get(&PoolKey::Bridge).unwrap();
         bridge.require_auth();
 
-        let asset: Address = s.get(&PoolKey::Token).unwrap();
-        token::Client::new(&env, &asset).transfer(
+        let state: PoolState = s.get(&PoolKey::State).unwrap();
+        token::Client::new(&env, &state.token).transfer(
             &user,
             env.current_contract_address(),
             &i128::try_from(amount).unwrap(),
         );
 
-        let fee_bps: u32 = s.get(&PoolKey::FeeBps).unwrap();
         let fee = if zero_fee {
             0
         } else {
-            amount * u128::from(fee_bps) / 10_000
+            amount * state.fee_share_bp / 10_000
         };
         let sold: u128 = s.get(&PoolKey::Sold).unwrap_or(0);
         s.set(&PoolKey::Sold, &(sold + amount));

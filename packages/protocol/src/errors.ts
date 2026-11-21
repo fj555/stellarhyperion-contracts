@@ -69,6 +69,11 @@ export const SOROBAN_ERROR_NAMES = [
   "ExceedsRouteLimit",
   "ProviderBudgetExceeded",
   "AdapterMethodUnavailable",
+  "RotationAlreadyPending",
+  "RotationNotPending",
+  "RotationNotReady",
+  "MessengerUnchanged",
+  "OldMessengerExpired",
 ] as const;
 
 export type SorobanErrorName = (typeof SOROBAN_ERROR_NAMES)[number];
@@ -126,6 +131,13 @@ export const EVM_ERROR_NAMES = [
   "RefundFailed",
   "ProviderBudgetExceeded",
   "AdapterMethodUnavailable",
+  "RotationAlreadyPending",
+  "RotationNotPending",
+  "RotationNotReady",
+  "MessengerUnchanged",
+  "OldMessengerExpired",
+  "TopUpIntentNotFound",
+  "TopUpBindingMismatch",
 ] as const;
 
 export type EvmErrorName = (typeof EVM_ERROR_NAMES)[number];
@@ -449,9 +461,45 @@ const HELP: Record<HyperionErrorName, Omit<ErrorHelp, "sorobanCode">> = {
     fault: "config",
     retryable: false,
   },
+  TopUpIntentNotFound: {
+    summary: "This gas top-up does not match an outbound transfer recorded by the adapter.",
+    fault: "input",
+    retryable: false,
+  },
+  TopUpBindingMismatch: {
+    summary:
+      "The gas top-up changes the sender, destination, token, amount, or message already bound to this transfer.",
+    fault: "input",
+    retryable: false,
+  },
   ExceedsRouteLimit: {
     summary: "That transfer exceeds the maximum single transfer limit configured for this route.",
     fault: "limit",
+    retryable: false,
+  },
+  RotationAlreadyPending: {
+    summary: "A rotation is already queued for this peer; cancel it before proposing a new one.",
+    fault: "config",
+    retryable: false,
+  },
+  RotationNotPending: {
+    summary: "No rotation is queued for this peer, so there is nothing to apply or cancel.",
+    fault: "config",
+    retryable: false,
+  },
+  RotationNotReady: {
+    summary: "The timelock delay on this peer rotation has not elapsed yet.",
+    fault: "timing",
+    retryable: true,
+  },
+  MessengerUnchanged: {
+    summary: "The proposed new messenger is the same as the current one.",
+    fault: "config",
+    retryable: false,
+  },
+  OldMessengerExpired: {
+    summary: "The in-flight message names a retired messenger whose acceptance window has closed.",
+    fault: "timing",
     retryable: false,
   },
 };

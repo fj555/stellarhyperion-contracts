@@ -53,6 +53,7 @@ contract RouterOutboundTest is Fixture {
         vm.prank(alice);
         router.bridgeOutBounded{value: 1}(request, 1);
         assertEq(itsRail.lastCall().value, 1);
+        assertEq(itsRail.lastCall().sender, alice);
         assertEq(alice.balance, 2);
         assertEq(router.outboundNonce(), 1);
     }

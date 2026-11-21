@@ -6,6 +6,11 @@
 # Read the existing lane before retrying. For the direct Stellar-to-Sepolia ITS testnet lane,
 # use docs/TESTNET_ACTIVATION.md; bare ITS does not require a far-side Hyperion peer.
 #
+# Deprecation guard: a record whose metadata marks it archived (status "deprecated" or
+# "archived", or carrying a successor link) is refused. Archived records keep their
+# transaction evidence but must never be used to link a lane. Point HYPERION_RECORD at the
+# successor record instead. A retired router is reported with the successor it was replaced by.
+#
 # Usage:
 #   HYPERION_PEER_CHAIN=arc-testnet \
 #   AXELAR_PEER_CHAIN=arc-8 \
@@ -18,6 +23,17 @@ require_identity
 
 RECORD="${HYPERION_RECORD:-$RECORD_DIR/stellar-$NETWORK-phase1.json}"
 [ -f "$RECORD" ] || die "no record at $RECORD; run script/stellar/deploy.sh first"
+
+# Refuse archived or deprecated records before touching any configuration.
+RECORD_STATE=$(node -e 'const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const s=(d.status??"active").toString().toLowerCase();const succ=d.successor??d.successorRecord??"";process.stdout.write(JSON.stringify({status:s,successor:succ,deprecated:s==="deprecated"||s==="archived"||Boolean(d.deprecated)||Boolean(d.archived)}))' "$RECORD")
+IS_ARCHIVED=$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).deprecated))' "$RECORD_STATE")
+if [ "$IS_ARCHIVED" = "true" ]; then
+  SUCCESSOR=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).successor||"")' "$RECORD_STATE")
+  if [ -n "$SUCCESSOR" ]; then
+    die "record $RECORD is archived; its router was retired. Successor: $SUCCESSOR. Re-run with HYPERION_RECORD set to the successor record."
+  fi
+  die "record $RECORD is archived and has no successor. Refusing to link an archived deployment."
+fi
 
 CHAIN_KEY=$(node -e 'const d=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(Object.keys(d.networks??{})[0]??"")' "$RECORD")
 [ -n "$CHAIN_KEY" ] || die "the record names no network"

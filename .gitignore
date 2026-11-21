@@ -51,3 +51,6 @@ lcov.info
 
 # Local planning notes, never committed
 .planning/
+
+# Generated authority observations from the local ownership rehearsal.
+evm/deployments/ownership-*.json

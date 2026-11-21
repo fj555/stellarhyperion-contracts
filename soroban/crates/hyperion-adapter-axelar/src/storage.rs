@@ -1,4 +1,4 @@
-use hyperion_core::HyperionError;
+use hyperion_core::{axelar::DestinationCapabilityRecord, HyperionError};
 use soroban_sdk::{contracttype, Address, BytesN, Env, String};
 
 use crate::types::{ChainLink, Config, PendingRotation};
@@ -28,6 +28,7 @@ pub enum DataKey {
     /// Minimum note version required by the configured destination. Missing means v1 for
     /// installations predating version negotiation.
     RequiredNoteVersion(String),
+    DestinationCapability(String, BytesN<32>),
     /// Emergency disable flag for a chain.
     Disabled(String),
     /// Retired names cannot be reused to bypass a peer rotation delay.
@@ -108,6 +109,24 @@ pub fn token_of(env: &Env, token_id: &BytesN<32>) -> Option<Address> {
     found
 }
 
+/// The same two reads without the TTL bump.
+///
+/// `token_id` and `token_of` extend a live entry's lifetime as a side effect, which is right on
+/// the transfer paths and wrong for a check whose contract is that validating a mapping changes
+/// nothing. A dry run that quietly renewed storage would make "no side effects" a claim nobody
+/// could test, so the diagnostic reads go through here instead.
+pub fn peek_token_id(env: &Env, token: &Address) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TokenId(token.clone()))
+}
+
+pub fn peek_token_of(env: &Env, token_id: &BytesN<32>) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Token(token_id.clone()))
+}
+
 pub fn set_token(env: &Env, token: &Address, token_id: &BytesN<32>) {
     let id_key = DataKey::TokenId(token.clone());
     let tok_key = DataKey::Token(token_id.clone());
@@ -119,6 +138,24 @@ pub fn set_token(env: &Env, token: &Address, token_id: &BytesN<32>) {
     env.storage()
         .persistent()
         .extend_ttl(&tok_key, BUMP_THRESHOLD, BUMP_TO);
+}
+
+pub fn destination_capability(
+    env: &Env,
+    chain: &String,
+    token_id: &BytesN<32>,
+) -> Option<DestinationCapabilityRecord> {
+    let key = DataKey::DestinationCapability(chain.clone(), token_id.clone());
+    env.storage().instance().get(&key)
+}
+
+pub fn set_destination_capability(env: &Env, record: &DestinationCapabilityRecord) {
+    let key = DataKey::DestinationCapability(record.chain.clone(), record.token_id.clone());
+    // Instance storage shares the configuration's TTL, which is already extended by bounded
+    // maintenance. Keeping admission with the instance prevents it expiring independently and
+    // silently disabling a still-active chain/token pair.
+    env.storage().instance().set(&key, record);
+    env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
 }
 
 /// Top a lane's lifetime back up without changing it.

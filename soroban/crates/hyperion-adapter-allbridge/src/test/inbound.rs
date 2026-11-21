@@ -1,9 +1,12 @@
 //! Tests for Allbridge inbound delivery resolution and validator verification.
 
 use ed25519_dalek::{Signer, SigningKey};
-use hyperion_core::{codec, HyperionError, RouteKind};
+use hyperion_core::{
+    address::{assert_route_supports, StellarDestination},
+    codec, AddressKind, HyperionError, RouteKind,
+};
 use hyperion_router::AdminAction;
-use soroban_sdk::{testutils::Address as _, Address, BytesN, U256};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, MuxedAddress, U256};
 
 use super::setup::{World, ETH_CHAIN_ID, HUNDRED, NOWHERE_CHAIN_ID};
 use crate::rail::{self, STELLAR_CHAIN_ID};
@@ -106,6 +109,22 @@ fn a_valid_validator_signature_delivers_tokens_to_recipient() {
 
     assert_eq!(claim_id, 0);
     assert_eq!(s.world.token().balance(&s.recipient), amount);
+}
+
+#[test]
+fn a_muxed_recipient_cannot_use_this_rail() {
+    let s = InboundSetup::new();
+    // There is no room for a muxed id in the 32-byte recipient word Allbridge signs. A muxed
+    // destination is still a real Stellar address, but it is not one this route may resolve, and
+    // `bridge_in` refuses that kind before it reads a signature or writes a claim.
+    let dest = StellarDestination::muxed(BytesN::from_array(&s.world.env, &[0x11; 32]), 900);
+    let encoded = dest.to_strkey(&s.world.env).unwrap();
+    assert_eq!(MuxedAddress::from_string(&encoded).id(), Some(900));
+    assert_eq!(dest.kind, AddressKind::MuxedAccount);
+    assert_eq!(
+        assert_route_supports(RouteKind::Allbridge, dest.kind),
+        Err(HyperionError::MuxedNotSupported)
+    );
 }
 
 #[test]

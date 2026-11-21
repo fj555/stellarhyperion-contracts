@@ -51,6 +51,9 @@ export * from "./chains.js";
 // Pricing a route locally so an app can render four of them while somebody types.
 export * from "./quotes.js";
 
+// Reading a token registration diagnostic, which both chains answer in the same shape.
+export * from "./tokenMapping.js";
+
 // Deployment records, and a loader that checks them instead of casting them.
 export * from "./deployments.js";
 

@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Destination, RouteKind} from "../../src/HyperionTypes.sol";
+import {IAxelarItsIntentAdapter} from "../../src/interfaces/IAxelarItsIntentAdapter.sol";
 import {IRailAdapter} from "../../src/interfaces/IRailAdapter.sol";
 
 /// @title A rail that does whatever the test needs
@@ -10,7 +11,7 @@ import {IRailAdapter} from "../../src/interfaces/IRailAdapter.sol";
 /// the remainder to the right contract. Proving that does not need a real rail, it needs a rail
 /// that remembers its arguments and can refund native currency, revert, or quote a chain it does
 /// not support, on demand.
-contract MockRailAdapter is IRailAdapter {
+contract MockRailAdapter is IRailAdapter, IAxelarItsIntentAdapter {
     error Rejected();
 
     struct Call {
@@ -19,6 +20,7 @@ contract MockRailAdapter is IRailAdapter {
         string chain;
         string strkey;
         uint64 nonce;
+        address sender;
         uint256 value;
     }
 
@@ -72,10 +74,37 @@ contract MockRailAdapter is IRailAdapter {
             chain: destination.chain,
             strkey: destination.strkey,
             nonce: nonce,
+            sender: address(0),
             value: msg.value
         });
         ++callCount;
 
+        if (_refundAmount != 0) {
+            (bool sent,) = payable(ROUTER).call{value: _refundAmount}("");
+            require(sent, "refund");
+        }
+        return _railRef;
+    }
+
+    function dispatchWithSender(
+        address token,
+        uint256 amount,
+        Destination calldata destination,
+        uint64 nonce,
+        address sender
+    ) external payable override returns (bytes32) {
+        if (ROUTE != RouteKind.AxelarIts) revert Rejected();
+        if (_dispatchReverts) revert Rejected();
+        _lastCall = Call({
+            token: token,
+            amount: amount,
+            chain: destination.chain,
+            strkey: destination.strkey,
+            nonce: nonce,
+            sender: sender,
+            value: msg.value
+        });
+        ++callCount;
         if (_refundAmount != 0) {
             (bool sent,) = payable(ROUTER).call{value: _refundAmount}("");
             require(sent, "refund");

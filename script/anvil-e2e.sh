@@ -15,6 +15,9 @@
 # timelock warp below is explicit and deterministic. The Stellar side (ledger time) is not exercised
 # here and must be validated separately.
 #
+# This local harness is not activation evidence: the active deployment gate remains Stellar
+# Testnet outbound ITS/CCTP. Adapter-owner controls here are distinct from router timelocks.
+#
 # Usage: script/anvil-e2e.sh
 set -euo pipefail
 
@@ -92,8 +95,14 @@ export STELLAR_RAIL_RECIPIENT=0x0d1ea8b866708fdad0f4ed8c677cf4fe66e56a2478372660
 export STELLAR_AXELAR_PEER=0x0d1ea8b866708fdad0f4ed8c677cf4fe66e56a247837266036e4e0f3d05c7b10
 
 note "phase one: deploy and queue"
-( cd "$EVM_DIR" && forge script script/Deploy.s.sol --rpc-url "$RPC" --broadcast --unlocked --sender "$SENDER" 2>&1 ) \
-  | grep -E '^  (router|cctp adapter|axelar adapter|queued|Queued|record)' || die "Deploy"
+DEPLOY_LOG=/tmp/hyperion-deploy.log
+if ! ( cd "$EVM_DIR" && forge script script/Deploy.s.sol --rpc-url "$RPC" --broadcast --unlocked --sender "$SENDER" ) \
+  >"$DEPLOY_LOG" 2>&1; then
+  cat "$DEPLOY_LOG"
+  die "Deploy"
+fi
+grep -E '^  (router|cctp adapter|axelar adapter|queued|Queued|record)' "$DEPLOY_LOG" \
+  || { cat "$DEPLOY_LOG"; die "Deploy output"; }
 
 note "the timelock has to refuse this"
 if ( cd "$EVM_DIR" && forge script script/Execute.s.sol --rpc-url "$RPC" --unlocked --sender "$SENDER" >/tmp/hyperion-early.log 2>&1 ); then

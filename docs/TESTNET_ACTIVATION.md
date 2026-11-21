@@ -1,5 +1,7 @@
 # Current Stellar Testnet deployment
 
+> **Status:** Active. This record is the single current Stellar Testnet deployment for outbound ITS/CCTP. Archived deployments are listed under "Deprecated and archived deployments" below; their addresses must not be used for activation or monitoring.
+
 The wallet-owned router and ITS adapter were deployed with the dedicated `hyperion-testnet-20261028` CLI wallet and activated after the normal 3600-second router timelock. This wallet owns the fresh deployment; it does not control the older October 1 router.
 
 | Setting          | Confirmed value                                              |
@@ -15,6 +17,35 @@ The wallet-owned router and ITS adapter were deployed with the dedicated `hyperi
 
 The received asset is the ITS representation of Stellar USDC, not Circle's native Sepolia USDC. Route 1 sends directly to the recipient through ITS and needs no EVM Hyperion adapter.
 
+## Axelar capability admission and upgrade compatibility
+
+The adapter now stores an explicit capability for each `(Hyperion chain, ITS token id)` pair. A
+record captures the current Axelar chain name, peer address, and locally reported ITS token-manager
+type. The capability is either `DirectItsTransfer` (recipient address, empty metadata) or
+`GmpPayload` (Hyperion peer address plus an authenticated note); a route instance cannot use the
+other shape. Dispatch and GMP callback acceptance fail closed if the record is missing, the manager
+type has changed, or the lane no longer matches the recorded peer. Soroban keeps these records in
+instance storage so the existing bounded instance-TTL maintenance keeps admission alive alongside
+the adapter configuration. Exact integer amounts,
+authenticated ITS calls, router replay protection and recipient-bound claims are unchanged.
+
+The active Sepolia source route is the bare `AxelarIts` shape. Its existing link and token mappings
+are not overwritten by admission, but the new capability key does not exist in older adapter state.
+When upgrading that adapter, retain the existing trusted link and USDC token mapping, then call
+`set_destination_capability` for the `sepolia` / existing ITS-USDC pair with
+`DirectItsTransfer`. Until this admission is written, the new implementation refuses dispatch;
+perform the upgrade and admission as one planned maintenance window, or configure a replacement
+adapter and switch the router through its normal timelock. Do not select `GmpPayload` for the
+active direct-transfer lane. CCTP configuration and delivery are unaffected.
+
+GMP instances need their own `GmpPayload` admission for each chain/token pair and still require
+the exact peer trust check. Repointing a chain or changing its token-manager type invalidates the
+old record and requires a fresh admin admission. The EVM Axelar adapter is separately gated:
+`developmentGateOpen` is false by default, and its GMP pair records and nonzero validation evidence
+must only be configured after independent EVM/destination validation. The evidence hash is an
+operator reference, not an on-chain proof. EVM and other unvalidated rail development must not be
+activated as part of the current Stellar Testnet rollout.
+
 ## Deployment evidence
 
 `deployments/stellar-testnet-phase1.json` is the canonical app/indexer record, retaining its historical filename. `deployments/evidence/2026-10-28-paid-its.json` records actual transaction hashes, ledgers, artifact hashes, token mapping, lane link, queued actions, execution and transfer acceptance status. Check that evidence for the latest source/destination verification result.
@@ -22,6 +53,29 @@ The received asset is the ITS representation of Stellar USDC, not Circle's nativ
 The current router uses WASM `281d946ea78b194c0ef44ad9488ed02b2aa6912fb4f6fbab523ad38f1e0803f1`; the CCTP adapter uses `80f109e7467ace6899f865a4f77079917a2bea8a5def593a4d87c08c09206af4`, built from forwarding implementation `b91c6ca`. The unchanged ITS adapter uses `5f32139554d29edc3501a39ae3d05761101234523dd48b4d9e2d81ebf001f2c3`, built from `60b3310`. Actual deployed code was downloaded and its SHA-256 verified. All initial configuration actions and the later CCTP/router upgrade actions were confirmed after their original 3600-second timelocks matured. No shortened timelock or bootstrap bypass was used.
 
 The older deployment is preserved in `deployments/archive/stellar-testnet-2026-10-01.json`. Its separate admin upgrade instructions are historical in `docs/LEGACY_TESTNET_UPGRADE.md`. Do not run those old-address commands against this fresh deployment.
+
+## Deprecated and archived deployments
+
+Deprecation is a status change, not a deletion. Archived records remain in the repository and their transaction evidence is retained in full; only their operational authority is withdrawn.
+
+| Record                                                 | Status     | Retired router                                             | Successor                                                    | Successor record                                |
+| ------------------------------------------------------ | ---------- | ---------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------- |
+| `deployments/archive/stellar-testnet-2026-10-01.json`  | `archived` | Router from the October 1 deployment (historical address)  | `CCXPCT3YFLVANSF3AQMYCCZVGCMLTURAYQ6O6DYGQJMTKVYQL6NTOC2V` | `deployments/stellar-testnet-phase1.json`       |
+
+Parsed metadata contract for tools:
+
+- `status: "active"` marks the only record eligible for activation, proposal generation, verification and monitoring.
+- `status: "archived"` marks a record that must be read-only for historical evidence. Consumers must not activate, queue, upgrade or monitor it.
+- Every archived record must carry `successor` (the active router address) and `supersededAt` (ISO-8601 timestamp) fields. A missing successor is a hard error.
+- Archiving never removes or rewrites `evidence` entries, transaction hashes, ledgers or artifact hashes.
+
+Actionable warnings for consumers:
+
+- If a tool is configured with the retired October 1 router address, it must refuse activation and emit a warning that names the successor router `CCXPCT3YFLVANSF3AQMYCCZVGCMLTURAYQ6O6DYGQJMTKVYQL6NTOC2V` and the record `deployments/stellar-testnet-phase1.json`.
+- Monitoring and indexing of a retired router is read-only and must be labelled `archived` in output. Do not present archived delivery or balance data as current.
+- Do not run the legacy upgrade instructions in `docs/LEGACY_TESTNET_UPGRADE.md` against the successor; they target retired addresses.
+
+Compatibility and migration: existing consumers that read only the active record are unaffected. Consumers that enumerate archive files must parse `status` and `successor` before use. Tools that previously accepted the archived router without checking status must be updated to refuse it; this is a breaking change for those tools and is listed here so it can be planned.
 
 ## Verified acceptance transfer
 

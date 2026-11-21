@@ -175,7 +175,7 @@ impl World {
     /// Teach the stand-in rail about itself: a pool, two remote bridges, and what relaying costs.
     fn wire_rail(&self) {
         let bridge = self.bridge();
-        bridge.add_pool(&self.pool_id, &self.token_key(&self.token_id));
+        bridge.add_pool(&self.pool_id, &self.token_id);
         bridge.register_bridge(&ETH_CHAIN_ID, &self.remote_bridge(0xE1));
         bridge.add_bridge_token(&ETH_CHAIN_ID, &self.receive_token());
         bridge.register_bridge(&BASE_CHAIN_ID, &self.remote_bridge(0xBA));

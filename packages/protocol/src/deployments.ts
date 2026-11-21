@@ -10,16 +10,24 @@
  * Deliberately not baked into the bundle either. A frontend that hard codes a router address is a
  * frontend that needs a release to follow a redeployment, and the one time that matters is during
  * an incident.
+ *
+ * Lifecycle. A record may be archived (retired) and may name a successor. An archived record stays
+ * in the set so its transaction evidence is never discarded, but `activeDeployment` and
+ * `activeNetworks` skip it, so tooling cannot accidentally activate or monitor a retired router.
+ * Consumers that name an archived record directly receive a `RetiredRouterWarning` describing the
+ * successor to migrate to.
  */
 import type { Hex } from "./bytes.js";
 import type { ChainKey } from "./chains.js";
-import { isChainKey } from "./chains.js";
-import type { RouteKind } from "./routes.js";
+import { chain, isChainKey } from "./chains.js";
+import { RouteKind } from "./routes.js";
 import { ROUTE_KINDS, ROUTE_SLUGS, tryRouteFromSlug } from "./routes.js";
 import { isStellarAddress } from "./addresses.js";
+import type { ProviderAddressOverrides } from "./registry/assets.js";
 
 /** The schema version of a deployment file, so an old file fails loudly rather than oddly. */
 export const DEPLOYMENT_SCHEMA_VERSION = 1;
+const MAX_UINT256 = (1n << 256n) - 1n;
 
 export interface DeployedAtEvm {
   /** Block the router landed in, as a string because JSON numbers stop being exact above 2^53. */
@@ -41,6 +49,8 @@ export interface EvmTokenDeployment {
   readonly flowLimit: string;
   /** Which rails this asset is registered for here. */
   readonly routes: readonly RouteKind[];
+  /** Optional provider-side token addresses; these never replace `address` or `decimals`. */
+  readonly providerAddresses?: Readonly<Partial<Record<RouteKind, Hex>>>;
 }
 
 export interface StellarTokenDeployment {
@@ -51,9 +61,25 @@ export interface StellarTokenDeployment {
   readonly decimals: number;
   readonly flowLimit: string;
   readonly routes: readonly RouteKind[];
+  /** Optional provider-side token addresses; these never replace `sacId` or `decimals`. */
+  readonly providerAddresses?: Readonly<Partial<Record<RouteKind, string>>>;
 }
 
-export interface EvmDeployment {
+/**
+ * Lifecycle metadata shared by every deployment record.
+ *
+ * `status` is `active` for the record operators should use, and `archived` for one that has been
+ * retired. `successor` names the chain key of the record that replaces an archived one, when there
+ * is one. `archivedAt` is an ISO 8601 timestamp recorded at the moment of retirement.
+ */
+export interface DeploymentLifecycle {
+  readonly status: "active" | "archived";
+  readonly archivedAt?: string;
+  readonly successor?: ChainKey;
+  readonly reason?: string;
+}
+
+export interface EvmDeployment extends DeploymentLifecycle {
   readonly family: "evm";
   readonly chain: ChainKey;
   readonly chainId: number;
@@ -73,7 +99,7 @@ export interface EvmDeployment {
   readonly commit: string;
 }
 
-export interface StellarDeployment {
+export interface StellarDeployment extends DeploymentLifecycle {
   readonly family: "stellar";
   readonly chain: ChainKey;
   readonly networkPassphrase: string;
@@ -112,6 +138,20 @@ export class DeploymentFormatError extends Error {
   }
 }
 
+/**
+ * Returned (not thrown) when a consumer names an archived router, so it can warn and redirect.
+ * `successor` is the active record the consumer should move to, if one is named and present.
+ */
+export interface RetiredRouterWarning {
+  readonly kind: "retired-router";
+  readonly chain: ChainKey;
+  readonly router: string;
+  readonly archivedAt?: string;
+  readonly reason?: string;
+  readonly successor?: Deployment;
+  readonly message: string;
+}
+
 function fail(path: string, reason: string): never {
   throw new DeploymentFormatError(path, reason);
 }
@@ -129,7 +169,7 @@ function asString(value: unknown, path: string): string {
 }
 
 function asInteger(value: unknown, path: string, min = 0): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < min) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min) {
     fail(path, `expected an integer of at least ${String(min)}`);
   }
   return value;
@@ -146,6 +186,8 @@ function asUintString(value: unknown, path: string): string {
     );
   }
   if (!/^\d+$/.test(value)) fail(path, "expected a decimal integer written as a string");
+  if (value.length > 78) fail(path, "expected a uint256 value");
+  if (BigInt(value) > MAX_UINT256) fail(path, "expected a uint256 value");
   return value;
 }
 
@@ -211,21 +253,87 @@ function asAdapters<T>(
   return out;
 }
 
+/**
+ * Read the lifecycle block. Absent means active, so every record written before archival existed
+ * keeps working unchanged. A present `archived` status must carry an `archivedAt`, so that every
+ * retirement is dated and a reviewer can tell when it was decided.
+ */
+function readLifecycle(raw: Record<string, unknown>, path: string): DeploymentLifecycle {
+  const status = raw.status === undefined ? "active" : raw.status;
+  if (status !== "active" && status !== "archived") {
+    fail(`${path}.status`, 'expected "active" or "archived"');
+  }
+  const archivedAt =
+    raw.archivedAt === undefined ? undefined : asTimestamp(raw.archivedAt, `${path}.archivedAt`);
+  if (status === "archived" && archivedAt === undefined) {
+    fail(`${path}.archivedAt`, "an archived record must say when it was archived");
+  }
+  if (status === "active" && archivedAt !== undefined) {
+    fail(`${path}.archivedAt`, "an active record cannot carry archivedAt");
+  }
+  let successor: ChainKey | undefined;
+  if (raw.successor !== undefined) {
+    const key = asString(raw.successor, `${path}.successor`);
+    if (!isChainKey(key)) fail(`${path}.successor`, `unknown chain key "${key}"`);
+    successor = key;
+  }
+  const reason = raw.reason === undefined ? undefined : asString(raw.reason, `${path}.reason`);
+  return {
+    status,
+    ...(archivedAt !== undefined ? { archivedAt } : {}),
+    ...(successor !== undefined ? { successor } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+function asProviderAddresses<T>(
+  value: unknown,
+  path: string,
+  routes: readonly RouteKind[],
+  adapters: Readonly<Partial<Record<RouteKind, unknown>>>,
+  read: (entry: unknown, entryPath: string) => T,
+): Partial<Record<RouteKind, T>> {
+  const addresses = asAdapters(value, path, read);
+  for (const route of ROUTE_KINDS) {
+    if (addresses[route] === undefined) continue;
+    if (!routes.includes(route)) {
+      fail(`${path}.${ROUTE_SLUGS[route]}`, "token does not support this provider rail");
+    }
+    if (adapters[route] === undefined) {
+      fail(`${path}.${ROUTE_SLUGS[route]}`, "deployment has no adapter for this provider rail");
+    }
+  }
+  return addresses;
+}
+
 function readEvmDeployment(
   raw: Record<string, unknown>,
   chain: ChainKey,
   path: string,
 ): EvmDeployment {
+  const adapters = asAdapters(raw.adapters, `${path}.adapters`, asEvmAddress);
   const tokensRaw = asRecord(raw.tokens, `${path}.tokens`);
   const tokens: Record<string, EvmTokenDeployment> = {};
   for (const [symbol, entry] of Object.entries(tokensRaw)) {
     const tokenPath = `${path}.tokens.${symbol}`;
     const token = asRecord(entry, tokenPath);
+    const routes = asRoutes(token.routes, `${tokenPath}.routes`);
+    const providerAddresses =
+      token.providerAddresses === undefined
+        ? undefined
+        : asProviderAddresses(
+            token.providerAddresses,
+            `${tokenPath}.providerAddresses`,
+            routes,
+            adapters,
+            asEvmAddress,
+          );
     tokens[symbol] = {
       address: asEvmAddress(token.address, `${tokenPath}.address`),
       decimals: asInteger(token.decimals, `${tokenPath}.decimals`),
       flowLimit: asUintString(token.flowLimit, `${tokenPath}.flowLimit`),
-      routes: asRoutes(token.routes, `${tokenPath}.routes`),
+      routes,
+      ...(providerAddresses === undefined ? {} : { providerAddresses }),
     };
   }
 
@@ -235,7 +343,7 @@ function readEvmDeployment(
     chain,
     chainId: asInteger(raw.chainId, `${path}.chainId`, 1),
     router: asEvmAddress(raw.router, `${path}.router`),
-    adapters: asAdapters(raw.adapters, `${path}.adapters`, asEvmAddress),
+    adapters,
     tokens,
     treasury: asEvmAddress(raw.treasury, `${path}.treasury`),
     admin: asEvmAddress(raw.admin, `${path}.admin`),
@@ -249,6 +357,7 @@ function readEvmDeployment(
       txHash: asHash(deployedAt.txHash, `${path}.deployedAt.txHash`),
     },
     commit: asString(raw.commit, `${path}.commit`),
+    ...readLifecycle(raw, path),
   };
 }
 
@@ -257,18 +366,31 @@ function readStellarDeployment(
   chain: ChainKey,
   path: string,
 ): StellarDeployment {
+  const adapters = asAdapters(raw.adapters, `${path}.adapters`, asStellarContract);
   const tokensRaw = asRecord(raw.tokens, `${path}.tokens`);
   const tokens: Record<string, StellarTokenDeployment> = {};
   for (const [symbol, entry] of Object.entries(tokensRaw)) {
     const tokenPath = `${path}.tokens.${symbol}`;
     const token = asRecord(entry, tokenPath);
+    const routes = asRoutes(token.routes, `${tokenPath}.routes`);
+    const providerAddresses =
+      token.providerAddresses === undefined
+        ? undefined
+        : asProviderAddresses(
+            token.providerAddresses,
+            `${tokenPath}.providerAddresses`,
+            routes,
+            adapters,
+            asStellarContract,
+          );
     tokens[symbol] = {
       sacId: asStellarContract(token.sacId, `${tokenPath}.sacId`),
       code: asString(token.code, `${tokenPath}.code`),
       issuer: asStellarAccount(token.issuer, `${tokenPath}.issuer`),
       decimals: asInteger(token.decimals, `${tokenPath}.decimals`),
       flowLimit: asUintString(token.flowLimit, `${tokenPath}.flowLimit`),
-      routes: asRoutes(token.routes, `${tokenPath}.routes`),
+      routes,
+      ...(providerAddresses === undefined ? {} : { providerAddresses }),
     };
   }
 
@@ -288,7 +410,7 @@ function readStellarDeployment(
     chain,
     networkPassphrase: asString(raw.networkPassphrase, `${path}.networkPassphrase`),
     router: asStellarContract(raw.router, `${path}.router`),
-    adapters: asAdapters(raw.adapters, `${path}.adapters`, asStellarContract),
+    adapters,
     tokens,
     treasury: asStellarAccount(raw.treasury, `${path}.treasury`),
     admin: asStellarAccount(raw.admin, `${path}.admin`),
@@ -302,6 +424,7 @@ function readStellarDeployment(
       timestamp: asTimestamp(deployedAt.timestamp, `${path}.deployedAt.timestamp`),
     },
     commit: asString(raw.commit, `${path}.commit`),
+    ...readLifecycle(raw, path),
   };
 }
 
@@ -310,6 +433,10 @@ function readStellarDeployment(
  *
  * Takes `unknown` on purpose. The input is a parsed JSON file or an HTTP response body, and both
  * of those are somebody else's output no matter how much this repository wrote them.
+ *
+ * Also checks the successor graph: a successor must name a record present in the same set, must
+ * not name itself, and must itself be active. A chain of archived records pointing at each other
+ * is refused, because a warning that redirects to another retired router is no warning at all.
  */
 export function parseDeploymentSet(value: unknown): DeploymentSet {
   const raw = asRecord(value, "$");
@@ -317,31 +444,143 @@ export function parseDeploymentSet(value: unknown): DeploymentSet {
   if (schemaVersion !== DEPLOYMENT_SCHEMA_VERSION) {
     fail(
       "$.schemaVersion",
-      `expected ${String(DEPLOYMENT_SCHEMA_VERSION)}, found ${String(schemaVersion)}`,
+      `this build reads schema ${String(DEPLOYMENT_SCHEMA_VERSION)}, file is ${String(schemaVersion)}`,
     );
   }
-
+  const generatedAt = asTimestamp(raw.generatedAt, "$.generatedAt");
   const networksRaw = asRecord(raw.networks, "$.networks");
   const networks: Partial<Record<ChainKey, Deployment>> = {};
   for (const [key, entry] of Object.entries(networksRaw)) {
+    if (!isChainKey(key)) fail(`$.networks.${key}`, "unknown chain key");
     const path = `$.networks.${key}`;
-    if (!isChainKey(key)) fail(path, "unknown chain key");
     const record = asRecord(entry, path);
-    const family = asString(record.family, `${path}.family`);
+    const family = record.family;
     if (family === "evm") {
+      if (chain(key).family !== "evm") fail(`${path}.family`, "does not match the chain family");
       networks[key] = readEvmDeployment(record, key, path);
     } else if (family === "stellar") {
+      if (chain(key).family !== "stellar") {
+        fail(`${path}.family`, "does not match the chain family");
+      }
       networks[key] = readStellarDeployment(record, key, path);
     } else {
-      fail(`${path}.family`, `expected "evm" or "stellar", found "${family}"`);
+      fail(`${path}.family`, 'expected "evm" or "stellar"');
     }
   }
 
+  for (const [key, deployment] of Object.entries(networks) as [ChainKey, Deployment][]) {
+    if (deployment.successor === undefined) continue;
+    const path = `$.networks.${key}.successor`;
+    if (deployment.successor === key) fail(path, "a record cannot succeed itself");
+    const next = networks[deployment.successor];
+    if (next === undefined) fail(path, `successor "${deployment.successor}" is not in this set`);
+    if (next.status !== "active") {
+      fail(
+        path,
+        `successor "${deployment.successor}" is itself archived; successors must be active`,
+      );
+    }
+  }
+
+  return { schemaVersion, generatedAt, networks };
+}
+
+/** Records that are still in service. Archived records are excluded by construction. */
+export function activeNetworks(set: DeploymentSet): Partial<Record<ChainKey, Deployment>> {
+  const out: Partial<Record<ChainKey, Deployment>> = {};
+  for (const [key, deployment] of Object.entries(set.networks) as [ChainKey, Deployment][]) {
+    if (deployment.status === "active") out[key] = deployment;
+  }
+  return out;
+}
+
+/**
+ * The active deployment for a chain, or `undefined` if there is none.
+ *
+ * An archived record returns `undefined` rather than itself. Callers that must still reason about a
+ * retired router (to warn, or to show history) use `findDeployment` and inspect `status`.
+ */
+export function activeDeployment(set: DeploymentSet, chain: ChainKey): Deployment | undefined {
+  const deployment = set.networks[chain];
+  return deployment?.status === "active" ? deployment : undefined;
+}
+
+/** Any record for a chain, active or archived, for history and evidence lookups. */
+export function findDeployment(set: DeploymentSet, chain: ChainKey): Deployment | undefined {
+  return set.networks[chain];
+}
+
+/**
+ * Build a warning for a consumer that has named a router. Returns `null` for an active record, so
+ * the common path costs one comparison. For an archived record it returns a structured warning that
+ * includes the active successor when one is named and present.
+ */
+export function retiredRouterWarning(
+  set: DeploymentSet,
+  chain: ChainKey,
+): RetiredRouterWarning | null {
+  const deployment = set.networks[chain];
+  if (deployment === undefined || deployment.status === "active") return null;
+  const successor =
+    deployment.successor !== undefined ? set.networks[deployment.successor] : undefined;
+  const activeSuccessor = successor?.status === "active" ? successor : undefined;
+  const target =
+    activeSuccessor !== undefined
+      ? `migrate to ${activeSuccessor.chain} (router ${activeSuccessor.family === "stellar" ? activeSuccessor.router : activeSuccessor.router})`
+      : "no active successor is recorded; do not activate or monitor this router";
   return {
-    schemaVersion,
-    generatedAt: asTimestamp(raw.generatedAt, "$.generatedAt"),
-    networks,
+    kind: "retired-router",
+    chain,
+    router: deployment.family === "stellar" ? deployment.router : deployment.router,
+    ...(deployment.archivedAt !== undefined ? { archivedAt: deployment.archivedAt } : {}),
+    ...(deployment.reason !== undefined ? { reason: deployment.reason } : {}),
+    ...(activeSuccessor !== undefined ? { successor: activeSuccessor } : {}),
+    message: `router for ${chain} is archived (${target})`,
   };
+}
+
+/**
+ * Whether the supplied deployment has the narrowly validated source-side wiring for outbound
+ * destination-minimum planning.
+ *
+ * This is intentionally not a general rail capability check: only Stellar Testnet CCTP and ITS
+ * have independent outbound validation today. A configured adapter and token route are both
+ * required, and merely adding another route to a deployment record does not enable this feature.
+ */
+export function hasValidatedOutboundQuoteWiring(
+  set: DeploymentSet,
+  chain: ChainKey,
+  symbol: string,
+  route: RouteKind,
+): boolean {
+  if (chain !== "stellar-testnet" || (route !== RouteKind.Cctp && route !== RouteKind.AxelarIts)) {
+    return false;
+  }
+  const deployment = set.networks[chain];
+  if (deployment?.status !== "active" || deployment.family !== "stellar") return false;
+  const token = deployment.tokens[symbol];
+  return deployment.adapters[route] !== undefined && token?.routes.includes(route) === true;
+}
+
+/** Collect deployment-scoped provider addresses into the endpoint-independent quote shape. */
+export function providerAddressOverridesFromDeploymentSet(
+  set: DeploymentSet,
+): ProviderAddressOverrides {
+  const overrides: Partial<Record<ChainKey, Record<string, Partial<Record<RouteKind, string>>>>> =
+    {};
+  for (const chainName of Object.keys(set.networks)) {
+    if (!isChainKey(chainName)) continue;
+    const deployment = set.networks[chainName];
+    if (deployment === undefined) continue;
+    for (const symbol of Object.keys(deployment.tokens)) {
+      const token = deployment.tokens[symbol];
+      if (token === undefined) continue;
+      if (token.providerAddresses === undefined) continue;
+      const bySymbol = (overrides[chainName] ??= {});
+      bySymbol[symbol] = token.providerAddresses;
+    }
+  }
+  return overrides;
 }
 
 export function isEvmDeployment(deployment: Deployment): deployment is EvmDeployment {

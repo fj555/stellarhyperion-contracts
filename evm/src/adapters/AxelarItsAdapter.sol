@@ -10,23 +10,37 @@ import {
     AlreadyConfigured,
     DecimalOverflow,
     InvalidAmount,
+    InvalidLimit,
+    ProviderBudgetExceeded,
     RailNotConfigured,
     RefundFailed,
     TimelockDelayOutOfRange,
     TimelockNotQueued,
     TimelockNotReady,
     TokenNotMapped,
+    TopUpBindingMismatch,
+    TopUpIntentNotFound,
     Unauthorized,
     UnexpectedRailContract,
     UnknownChain,
     UnsupportedHookVersion,
     ZeroAddress
 } from "../HyperionErrors.sol";
-import {AddressKind, Destination, Origin, RouteKind} from "../HyperionTypes.sol";
+import {
+    AddressKind,
+    Destination,
+    Origin,
+    RouteKind,
+    TokenMappingConflict,
+    TokenMappingReport,
+    TokenMappingRequest
+} from "../HyperionTypes.sol";
 import {
     IAxelarGasService,
     IInterchainTokenExecutable,
-    IInterchainTokenService
+    IInterchainTokenManager,
+    IInterchainTokenService,
+    ITokenManager
 } from "../interfaces/IAxelar.sol";
 import {IHyperionRouter} from "../interfaces/IHyperionRouter.sol";
 import {IRailAdapter} from "../interfaces/IRailAdapter.sol";
@@ -50,6 +64,19 @@ import {StellarAddress} from "../libraries/StellarAddress.sol";
 /// disagree about how long an address is and about whether it is even binary.
 contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2Step {
     using SafeERC20 for IERC20;
+
+    /// @notice The delivery surface admitted for a chain/token-manager pair.
+    enum DestinationCapability {
+        DirectItsTransfer,
+        GmpPayload
+    }
+
+    struct CapabilityRecord {
+        uint8 tokenManagerType;
+        DestinationCapability capability;
+        bytes32 peerHash;
+        bool configured;
+    }
 
     /// @notice The value ITS requires a receiving contract to return from `executeWithInterchainToken`.
     /// @dev What ITS insists a receiving contract hands back. Not reverting is not enough: Axelar
@@ -83,6 +110,44 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
     /// @notice Minimum delay before a proposed peer rotation can become active (1 hour).
     uint64 public constant MIN_ROTATION_DELAY = 1 hours;
 
+    /// @dev The top-up intent stores only fixed-size digests and integers. These bounds keep
+    /// source-side destination metadata bounded before it is committed into an intent.
+    /// @notice Maximum destination chain name length for an intent.
+    uint256 public constant MAX_DESTINATION_CHAIN_LENGTH = 64;
+    /// @notice Maximum destination strkey length for an intent.
+    uint256 public constant MAX_DESTINATION_STRKEY_LENGTH = 69;
+
+    /// @notice Exact outbound transfer fields which a later gas top-up is allowed to reference.
+    struct TransferIntent {
+        bytes32 destinationBinding;
+        bytes32 tokenId;
+        address token;
+        uint256 amount;
+        uint64 nonce;
+        address sender;
+        bytes32 messageTxHash;
+        uint256 messageLogIndex;
+        address refundAddress;
+        uint256 maxNativeSpend;
+        uint256 nativeSpent;
+        bool exists;
+        bool messageBound;
+    }
+
+    /// @notice The bounded metadata a payer must echo when topping up an ITS transfer.
+    struct TopUpMetadata {
+        bytes32 intentId;
+        address sender;
+        bytes32 txHash;
+        uint256 logIndex;
+        bytes32 destinationBinding;
+        bytes32 tokenId;
+        address token;
+        uint256 originalAmount;
+        address refundAddress;
+        uint256 maxNativeSpend;
+    }
+
     /// @notice A proposed peer rotation awaiting the timelock delay.
     struct PeerRotation {
         bytes newPeer;
@@ -100,9 +165,31 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
     /// that is allowed to speak for it without the caller telling us which key to look under.
     mapping(string axelarChain => string chain) private _byAxelarName;
 
+    /// @dev Outbound dispatches are immutable top-up intents. The first top-up binds its Axelar
+    /// source log and refund address; later top-ups must repeat that binding and share its cap.
+    mapping(bytes32 intentId => TransferIntent intent) private _topUpIntents;
+    mapping(bytes32 messageBinding => bytes32 intentId) private _intentByMessage;
+
     /// @notice The ITS token id this chain's ERC20 is registered under, or zero if it is not
     /// linked. An unlinked token is a token this adapter will refuse to send.
     mapping(address token => bytes32 tokenId) public tokenIdOf;
+
+    /// @dev The EVM adapter remains closed until operators independently validate this rail.
+    /// @notice Whether independent validation permits development execution.
+    bool public developmentGateOpen;
+    /// @notice Operator supplied independent validation evidence digest.
+    bytes32 public developmentValidationEvidence;
+    mapping(bytes32 key => CapabilityRecord record) private _capabilities;
+    /// @dev And back again, which is what makes the inbound allowlist and the reverse half of a
+    /// registration conflict answerable without an event scan. Kept in step with `tokenIdOf` by
+    /// `linkToken` and by nothing else.
+    mapping(bytes32 tokenId => address token) private _tokenOfId;
+
+    /// @notice The token manager kind Axelar uses for a token id, cached when it was linked.
+    /// @dev Not consulted by any transfer path: `dispatch` and `executeWithInterchainToken` read
+    /// nothing from here. It exists so a dry run can compare what an operator believes against
+    /// what Axelar said at registration time, and it is refreshed only by a successful link.
+    mapping(bytes32 tokenId => uint256 managerType) private _managerTypeOfId;
 
     /// @notice A chain became reachable.
     event PeerConfigured(string chain, string axelarChain, bytes peer);
@@ -127,11 +214,40 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
 
     /// @notice A token became routable over ITS.
     event TokenLinked(address indexed token, bytes32 tokenId);
+    /// @notice A chain/token-manager pair was admitted for the GMP payload surface.
+    event DestinationCapabilitySet(
+        string chain, bytes32 indexed tokenId, uint8 tokenManagerType, DestinationCapability capability
+    );
+    /// @notice EVM development use was enabled or disabled with a validation evidence hash.
+    event DevelopmentGateSet(bool enabled, bytes32 validationEvidence);
 
     /// @notice A transfer was handed to ITS.
     event TransferSubmitted(
         string chain, bytes32 tokenId, uint256 amount, uint64 nonce, uint256 gasValue, bytes note
     );
+
+    /// @notice Immutable outbound metadata that a top-up must identify exactly.
+    event TransferIntentRecorded(
+        bytes32 indexed intentId,
+        bytes32 indexed destinationBinding,
+        bytes32 tokenId,
+        address token,
+        uint256 amount,
+        uint64 nonce,
+        address sender
+    );
+
+    /// @notice A top-up bound to one source-chain ITS message and refund recipient.
+    event GasTopUpBound(
+        bytes32 indexed intentId,
+        bytes32 indexed txHash,
+        uint256 logIndex,
+        address refundAddress,
+        uint256 maxNativeSpend
+    );
+
+    /// @notice Native gas was added against an existing transfer intent.
+    event GasToppedUp(bytes32 indexed intentId, uint256 amount, uint256 totalSpent);
 
     /// @notice A delivery arrived from a peer and was passed to the router.
     event DeliveryAccepted(
@@ -170,7 +286,7 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
     /// @inheritdoc IRailAdapter
     function supportsChain(string calldata chain) external view override returns (bool) {
         Peer storage peer = _peers[chain];
-        return peer.configured && peer.enabled;
+        return developmentGateOpen && peer.configured && peer.enabled;
     }
 
     /// @inheritdoc IRailAdapter
@@ -197,13 +313,18 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         returns (Peer memory peer, bytes32 tokenId, AddressKind kind)
     {
         if (amount == 0) revert InvalidAmount();
+        if (
+            bytes(destination.chain).length > MAX_DESTINATION_CHAIN_LENGTH
+                || bytes(destination.strkey).length > MAX_DESTINATION_STRKEY_LENGTH
+        ) revert InvalidLimit();
 
         tokenId = tokenIdOf[token];
         if (tokenId == bytes32(0)) revert TokenNotMapped();
 
         peer = _peers[destination.chain];
         if (!peer.configured) revert UnknownChain();
-        if (!peer.enabled) revert RailNotConfigured();
+        if (!peer.enabled || !developmentGateOpen) revert RailNotConfigured();
+        _requireCapability(destination.chain, tokenId, peer);
 
         (kind,,) = StellarAddress.parse(destination.strkey);
     }
@@ -216,11 +337,58 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         returns (bytes32)
     {
         if (msg.sender != ROUTER) revert Unauthorized();
+        return _dispatch(token, amount, destination, nonce, address(0));
+    }
+
+    /// @notice Router entrypoint that additionally records the original transfer sender.
+    function dispatchWithSender(
+        address token,
+        uint256 amount,
+        Destination calldata destination,
+        uint64 nonce,
+        address sender
+    ) external payable returns (bytes32) {
+        if (msg.sender != ROUTER) revert Unauthorized();
+        if (sender == address(0)) revert ZeroAddress();
+        return _dispatch(token, amount, destination, nonce, sender);
+    }
+
+    function _dispatch(
+        address token,
+        uint256 amount,
+        Destination calldata destination,
+        uint64 nonce,
+        address sender
+    ) private returns (bytes32) {
         (Peer memory peer, bytes32 tokenId, AddressKind kind) = _dispatchPlan(token, amount, destination);
         uint8 noteVersion = HyperionNotes.negotiateNoteVersion(requiredNoteVersion(destination.chain));
         if (noteVersion != 1) revert UnsupportedHookVersion();
         bytes memory note = HyperionNotes.encodeInboundNote(kind, destination.strkey, nonce);
+        bytes32 destinationBinding =
+            keccak256(abi.encode(destination.chain, destination.strkey, peer.axelarChain, peer.peer));
+        bytes32 intentId = keccak256(
+            abi.encode(
+                block.chainid, address(this), nonce, destinationBinding, tokenId, token, amount, sender
+            )
+        );
+        if (_topUpIntents[intentId].exists) revert TopUpBindingMismatch();
+        _topUpIntents[intentId] = TransferIntent({
+            destinationBinding: destinationBinding,
+            tokenId: tokenId,
+            token: token,
+            amount: amount,
+            nonce: nonce,
+            sender: sender,
+            messageTxHash: bytes32(0),
+            messageLogIndex: 0,
+            refundAddress: address(0),
+            maxNativeSpend: 0,
+            nativeSpent: 0,
+            exists: true,
+            messageBound: false
+        });
         emit TransferSubmitted(destination.chain, tokenId, amount, nonce, msg.value, note);
+        emit TransferIntentRecorded(intentId, destinationBinding, tokenId, token, amount, nonce, sender);
 
         IERC20(token).forceApprove(address(ITS), amount);
         ITS.interchainTransfer{value: msg.value}(
@@ -256,6 +424,7 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         uint256 amount
     ) external override returns (bytes32) {
         if (msg.sender != address(ITS)) revert Unauthorized();
+        if (!developmentGateOpen) revert RailNotConfigured();
         if (amount == 0) revert InvalidAmount();
         if (tokenIdOf[token] != tokenId) revert TokenNotMapped();
 
@@ -266,6 +435,7 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         // any connected chain can call ITS with a payload, so this is the check that turns "a
         // transfer arrived" into "Hyperion sent this".
         if (keccak256(sourceAddress) != keccak256(peer.peer)) revert UnexpectedRailContract();
+        _requireCapability(chain, tokenId, peer);
 
         (address recipient, uint64 sourceNonce) = HyperionNotes.decodeOutboundNote(data);
 
@@ -293,14 +463,67 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         return EXECUTE_SUCCESS;
     }
 
-    /// @notice Pay Axelar more gas for a delivery that ran short.
-    /// @dev Permissionless, because a stuck transfer is somebody's money and the person most
-    /// motivated to unstick it is not always the operator. Whoever pays gets nothing back except
-    /// the transfer going through, which is the only incentive that needs to exist here.
-    function topUpGas(bytes32 txHash, uint256 logIndex, address refundAddress) external payable {
+    /// @notice Pay Axelar more gas for a previously dispatched ITS message.
+    /// @dev The intent metadata and sender are fixed and recorded by `dispatch`; it cannot redirect
+    /// the original token transfer or alter its recipient or amount. Only that sender may bind the
+    /// source transaction/log and refund address. Subsequent top-ups must repeat that binding and
+    /// share its cumulative native-spend cap. Axelar's `(txHash, logIndex)` identifies the delivery.
+    function topUpGas(TopUpMetadata calldata metadata) external payable {
         if (msg.value == 0) revert InvalidAmount();
-        if (refundAddress == address(0)) revert ZeroAddress();
-        GAS_SERVICE.addNativeGas{value: msg.value}(txHash, logIndex, refundAddress);
+        if (metadata.txHash == bytes32(0) || metadata.refundAddress == address(0)) {
+            revert ZeroAddress();
+        }
+        if (metadata.maxNativeSpend == 0) revert InvalidAmount();
+
+        TransferIntent storage intent = _topUpIntents[metadata.intentId];
+        if (!intent.exists) revert TopUpIntentNotFound();
+        if (msg.sender != intent.sender || metadata.sender != intent.sender) revert Unauthorized();
+        if (
+            metadata.destinationBinding != intent.destinationBinding || metadata.tokenId != intent.tokenId
+                || metadata.token != intent.token || metadata.originalAmount != intent.amount
+        ) revert TopUpBindingMismatch();
+
+        if (!intent.messageBound) {
+            bytes32 messageBinding = keccak256(abi.encode(metadata.txHash, metadata.logIndex));
+            bytes32 boundIntent = _intentByMessage[messageBinding];
+            if (boundIntent != bytes32(0) && boundIntent != metadata.intentId) {
+                revert TopUpBindingMismatch();
+            }
+            intent.messageTxHash = metadata.txHash;
+            intent.messageLogIndex = metadata.logIndex;
+            intent.refundAddress = metadata.refundAddress;
+            intent.maxNativeSpend = metadata.maxNativeSpend;
+            intent.messageBound = true;
+            _intentByMessage[messageBinding] = metadata.intentId;
+            emit GasTopUpBound(
+                metadata.intentId,
+                metadata.txHash,
+                metadata.logIndex,
+                metadata.refundAddress,
+                metadata.maxNativeSpend
+            );
+        } else if (
+            intent.messageTxHash != metadata.txHash || intent.messageLogIndex != metadata.logIndex
+                || intent.refundAddress != metadata.refundAddress
+                || intent.maxNativeSpend != metadata.maxNativeSpend
+        ) {
+            revert TopUpBindingMismatch();
+        }
+
+        if (
+            intent.nativeSpent > intent.maxNativeSpend
+                || msg.value > intent.maxNativeSpend - intent.nativeSpent
+        ) revert ProviderBudgetExceeded();
+        uint256 totalSpent = intent.nativeSpent + msg.value;
+        intent.nativeSpent = totalSpent;
+        address refundRecipient = metadata.refundAddress;
+        GAS_SERVICE.addNativeGas{value: msg.value}(metadata.txHash, metadata.logIndex, refundRecipient);
+        emit GasToppedUp(metadata.intentId, msg.value, totalSpent);
+    }
+
+    /// @notice Read the immutable outbound fields and mutable gas budget for a top-up intent.
+    function topUpIntent(bytes32 intentId) external view returns (TransferIntent memory) {
+        return _topUpIntents[intentId];
     }
 
     /// @notice Make a chain reachable, and name the contract allowed to speak for it.
@@ -426,15 +649,233 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
     /// @dev Once only. An id is the same value on every chain ITS connects, so getting it right
     /// once is the whole job, and being able to change it later is only useful to somebody who
     /// wants a transfer to arrive as a different asset than it left as.
+    ///
+    /// A link that is already in place is never rewritten. Where the stored link disagrees with
+    /// the arguments the call is refused with `AlreadyConfigured` rather than quietly overwritten,
+    /// because the reverse mapping is the inbound allowlist and repointing it would change which
+    /// asset an arriving delivery is paid in. Repeating the same link is accepted and writes
+    /// nothing, so a deploy script that runs twice is boring. To see exactly which fields
+    /// disagree, call `checkTokenMapping` first.
     function linkToken(address token, bytes32 tokenId) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         if (tokenId == bytes32(0)) revert TokenNotMapped();
-        if (tokenIdOf[token] != bytes32(0)) revert AlreadyConfigured();
-        // ITS knows which ERC20 an id belongs to on this chain. Asking rather than trusting the
-        // argument turns a typo into a failed transaction now instead of a failed delivery later.
-        if (ITS.registeredTokenAddress(tokenId) != token) revert TokenNotMapped();
+
+        TokenMappingReport memory report = _inspectTokenMapping(
+            TokenMappingRequest({
+                token: token,
+                tokenId: tokenId,
+                expectedDecimals: 0,
+                hasExpectedDecimals: false,
+                expectedManagerType: 0,
+                hasExpectedManagerType: false
+            })
+        );
+        if (report.conflicts.length != 0) {
+            // Two different mistakes with two different fixes. A link that would repoint an
+            // existing mapping is a configuration clash; anything else is Axelar not knowing the
+            // asset, which the caller has to resolve before the link means anything.
+            TokenMappingConflict first = report.conflicts[0];
+            if (first == TokenMappingConflict.TokenId || first == TokenMappingConflict.LocalToken) {
+                revert AlreadyConfigured();
+            }
+            revert TokenNotMapped();
+        }
+
+        // The link already reads back exactly as proposed. Writing it again would only republish
+        // an event for a change that did not happen, so this is a successful no-op.
+        if (report.mappedTokenId == tokenId && report.mappedToken == token) return;
+
         tokenIdOf[token] = tokenId;
+        _tokenOfId[tokenId] = token;
+        _managerTypeOfId[tokenId] = report.railManagerType;
         emit TokenLinked(token, tokenId);
+    }
+
+    /// @notice Admit a reviewed chain and token manager without opening the development gate.
+    function setDestinationCapability(
+        string calldata chain,
+        address token,
+        uint8 tokenManagerType,
+        DestinationCapability capability
+    ) external onlyOwner {
+        Peer memory peer = _peers[chain];
+        if (!peer.configured) revert UnknownChain();
+        bytes32 tokenId = tokenIdOf[token];
+        if (tokenId == bytes32(0) || ITS.registeredTokenAddress(tokenId) != token) {
+            revert TokenNotMapped();
+        }
+        if (
+            capability != DestinationCapability.GmpPayload
+                || tokenManagerType != _currentTokenManagerType(tokenId)
+        ) revert RailNotConfigured();
+        _capabilities[_capabilityKey(chain, tokenId)] = CapabilityRecord({
+            tokenManagerType: tokenManagerType,
+            capability: capability,
+            peerHash: keccak256(peer.peer),
+            configured: true
+        });
+        emit DestinationCapabilitySet(chain, tokenId, tokenManagerType, capability);
+    }
+
+    /// @notice Open development dispatch only with explicit independent validation evidence.
+    function setDevelopmentGate(bool enabled, bytes32 validationEvidence) external onlyOwner {
+        if (enabled && validationEvidence == bytes32(0)) revert RailNotConfigured();
+        developmentGateOpen = enabled;
+        developmentValidationEvidence = validationEvidence;
+        emit DevelopmentGateSet(enabled, validationEvidence);
+    }
+
+    /// @notice Report what linking `token` to `tokenId` would do, without doing any of it.
+    /// @dev The EVM half of the Stellar adapter's `check_token_mapping`, and it answers the same
+    /// question in the same order: every field that disagrees, named, rather than the first one
+    /// that would have caused a revert. A caller passes `expectedDecimals` and
+    /// `expectedManagerType` to have those judged; leaving them out reports what was observed
+    /// without judging it.
+    ///
+    /// Read only. Nothing here writes storage or emits an event, so calling it twice leaves the
+    /// adapter exactly as it found it, which is what makes it usable as a rehearsal step in a
+    /// deployment script.
+    /// @param token The local ERC20 the caller proposes to link.
+    /// @param tokenId The ITS token id the caller proposes to link it to.
+    /// @param expectedDecimals Decimals the caller expects the local asset to report.
+    /// @param hasExpectedDecimals Whether `expectedDecimals` should be judged at all.
+    /// @param expectedManagerType The `TokenManagerType` discriminant the caller expects.
+    /// @param hasExpectedManagerType Whether `expectedManagerType` should be judged at all.
+    function checkTokenMapping(
+        address token,
+        bytes32 tokenId,
+        uint8 expectedDecimals,
+        bool hasExpectedDecimals,
+        uint256 expectedManagerType,
+        bool hasExpectedManagerType
+    ) external view returns (TokenMappingReport memory) {
+        return _inspectTokenMapping(
+            TokenMappingRequest({
+                token: token,
+                tokenId: tokenId,
+                expectedDecimals: expectedDecimals,
+                hasExpectedDecimals: hasExpectedDecimals,
+                expectedManagerType: expectedManagerType,
+                hasExpectedManagerType: hasExpectedManagerType
+            })
+        );
+    }
+
+    /// @notice The local asset already linked to a token id, or the zero address.
+    /// @dev The reverse half of `tokenIdOf`, and the map the inbound path's allowlist check
+    /// effectively uses.
+    function tokenOfId(bytes32 tokenId) external view returns (address) {
+        return _tokenOfId[tokenId];
+    }
+
+    /// @notice The manager kind Axelar reported for a token id when it was linked.
+    /// @dev Zero is both "no manager recorded" and `NativeInterchainToken`, so this is only
+    /// meaningful for an id where `tokenIdOf` is non-zero.
+    function managerTypeOfId(bytes32 tokenId) external view returns (uint256) {
+        return _managerTypeOfId[tokenId];
+    }
+
+    /// @dev Build the report `checkTokenMapping` returns and `linkToken` acts on.
+    ///
+    /// Every read is allowed to fail. ITS reverts for an id it has no manager for, and a token
+    /// that is not a real ERC20 answers nothing; neither is an error here, it is a fact the
+    /// report carries so the caller can tell "Axelar has never heard of this id" apart from
+    /// "Axelar knows the id and it belongs to a different asset".
+    function _inspectTokenMapping(TokenMappingRequest memory request)
+        private
+        view
+        returns (TokenMappingReport memory report)
+    {
+        report.token = request.token;
+        report.tokenId = request.tokenId;
+        report.mappedTokenId = tokenIdOf[request.token];
+        report.mappedToken = _tokenOfId[request.tokenId];
+
+        // What Axelar itself says is behind this id.
+        try ITS.registeredTokenAddress(request.tokenId) returns (address registered) {
+            report.railToken = registered;
+        } catch {}
+        try ITS.tokenManagerAddress(request.tokenId) returns (address manager) {
+            report.railManager = manager;
+        } catch {}
+        if (report.railManager != address(0)) {
+            // A static call rather than a typed one: `try` catches a revert but not a decode
+            // failure, and an address with no code returns nothing at all. A manager that cannot
+            // be read is a fact this report carries, not a reason to fail the whole check.
+            (bool okKind, bytes memory kindRet) = report.railManager
+                .staticcall(abi.encodeWithSelector(ITokenManager.implementationType.selector));
+            if (okKind && kindRet.length == 32) {
+                report.railManagerType = abi.decode(kindRet, (uint256));
+                report.managerTypeKnown = true;
+            }
+        }
+
+        // A token that cannot answer `decimals()` is not an error, it is a token whose decimals
+        // are unknown, which is a different finding from a token whose decimals are wrong.
+        (bool ok, bytes memory ret) = request.token.staticcall(abi.encodeWithSignature("decimals()"));
+        if (ok && ret.length == 32) {
+            uint256 raw = abi.decode(ret, (uint256));
+            if (raw <= type(uint8).max) {
+                // Safe: the guard above is exactly the range check.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                report.onchainDecimals = uint8(raw);
+                report.decimalsKnown = true;
+            }
+        }
+
+        report.conflicts = _classifyTokenMapping(request, report);
+    }
+
+    /// @dev Derive every disagreement from the observations, in the fixed order the Stellar side
+    /// uses. Pure and separated from the reads, because these are the rules both chains have to
+    /// agree on and the order is what makes two runs over the same facts print the same list.
+    ///
+    /// Two passes rather than a push: the length of the array has to be known before it is
+    /// allocated, and computing the findings twice in a pure function is cheaper than growing an
+    /// array across five branches.
+    function _classifyTokenMapping(TokenMappingRequest memory request, TokenMappingReport memory report)
+        private
+        pure
+        returns (TokenMappingConflict[] memory conflicts)
+    {
+        // A link that would move an asset already linked elsewhere silently changes where money
+        // goes. Both directions are checked because they fail differently: the forward one breaks
+        // outbound dispatch, the reverse one makes an inbound delivery pay a token nobody linked.
+        bool idConflict = report.mappedTokenId != bytes32(0) && report.mappedTokenId != request.tokenId;
+        bool tokenConflict = report.mappedToken != address(0) && report.mappedToken != request.token;
+        bool railTokenConflict = report.railToken != address(0) && report.railToken != request.token;
+        // A zero `railToken` is the rail not knowing the id, which is also the answer to "is there
+        // a manager": ITS registers the two together.
+        bool unregistered = report.railToken == address(0);
+        // Judged on whether a kind was read, not on its value: zero is a real kind, so a
+        // `NativeInterchainToken` manager reporting `0` is not the same as no manager at all.
+        bool managerMissing = request.hasExpectedManagerType && !report.managerTypeKnown;
+        bool decimalsConflict = request.hasExpectedDecimals && report.decimalsKnown
+            && report.onchainDecimals != request.expectedDecimals;
+        bool decimalsUnreadable = request.hasExpectedDecimals && !report.decimalsKnown;
+        bool managerConflict = request.hasExpectedManagerType && report.managerTypeKnown
+            && report.railManagerType != request.expectedManagerType;
+
+        uint256 size;
+        if (idConflict) ++size;
+        if (tokenConflict) ++size;
+        if (unregistered) ++size;
+        if (railTokenConflict) ++size;
+        if (decimalsUnreadable) ++size;
+        if (decimalsConflict) ++size;
+        if (managerMissing) ++size;
+        if (managerConflict) ++size;
+
+        conflicts = new TokenMappingConflict[](size);
+        uint256 cursor;
+        if (idConflict) conflicts[cursor++] = TokenMappingConflict.TokenId;
+        if (tokenConflict) conflicts[cursor++] = TokenMappingConflict.LocalToken;
+        if (unregistered) conflicts[cursor++] = TokenMappingConflict.UnregisteredTokenId;
+        if (railTokenConflict) conflicts[cursor++] = TokenMappingConflict.RailTokenMismatch;
+        if (decimalsUnreadable) conflicts[cursor++] = TokenMappingConflict.UnreadableMetadata;
+        if (decimalsConflict) conflicts[cursor++] = TokenMappingConflict.Decimals;
+        if (managerMissing) conflicts[cursor++] = TokenMappingConflict.UnregisteredTokenId;
+        if (managerConflict) conflicts[cursor++] = TokenMappingConflict.ManagerType;
     }
 
     /// @notice Read a configured chain.
@@ -478,10 +919,44 @@ contract AxelarItsAdapter is IRailAdapter, IInterchainTokenExecutable, Ownable2S
         return false;
     }
 
+    /// @notice Read-only inspection of the expected spender and gas recipient for paid dispatch on EVM.
+    /// @dev The router alone calls dispatch; ITS alone is approved for token movement.
+    /// Gas payment is forwarded directly in msg.value to ITS, which relays to AxelarGasService.
+    function inspectPaidDispatchTargets()
+        external
+        view
+        returns (address itsSpender, address gasServiceRecipient)
+    {
+        return (address(ITS), address(GAS_SERVICE));
+    }
+
     function _refund() private {
         uint256 balance = address(this).balance;
         if (balance == 0) return;
         (bool sent,) = payable(ROUTER).call{value: balance}("");
         if (!sent) revert RefundFailed();
+    }
+
+    function _requireCapability(string memory chain, bytes32 tokenId, Peer memory peer) private view {
+        CapabilityRecord storage record = _capabilities[_capabilityKey(chain, tokenId)];
+        if (
+            !record.configured || record.capability != DestinationCapability.GmpPayload
+                || record.peerHash != keccak256(peer.peer)
+                || record.tokenManagerType != _currentTokenManagerType(tokenId)
+        ) revert RailNotConfigured();
+    }
+
+    function _currentTokenManagerType(bytes32 tokenId) private view returns (uint8) {
+        address manager = ITS.tokenManagerAddress(tokenId);
+        if (manager == address(0)) revert TokenNotMapped();
+        uint256 managerType = IInterchainTokenManager(manager).implementationType();
+        if (managerType > type(uint8).max) revert RailNotConfigured();
+        // The preceding uint8 maximum check prevents truncation.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint8(managerType);
+    }
+
+    function _capabilityKey(string memory chain, bytes32 tokenId) private pure returns (bytes32) {
+        return keccak256(abi.encode(chain, tokenId));
     }
 }

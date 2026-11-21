@@ -6,7 +6,7 @@
 //! shape grew an inbound leg.
 
 use hyperion_core::{
-    axelar::{InboundNote, NOTE_VERSION},
+    axelar::{DestinationCapability, InboundNote, NOTE_VERSION},
     codec,
     strkey::{StrkeyDestination, STRKEY_LEN_MUXED, STRKEY_LEN_PLAIN},
     AddressKind, RouteKind, DEFAULT_FLOW_WINDOW_LEDGERS, STELLAR_DECIMALS,
@@ -278,6 +278,26 @@ impl World {
             adapter.map_token(&self.token_id, &self.burn_id());
             adapter.map_token(&self.lock_asset, &self.lock_id());
         }
+        self.adapter().set_destination_capability(
+            &self.ethereum(),
+            &self.token_id,
+            &DestinationCapability::GmpPayload,
+        );
+        self.adapter().set_destination_capability(
+            &self.ethereum(),
+            &self.lock_asset,
+            &DestinationCapability::GmpPayload,
+        );
+        self.bare().set_destination_capability(
+            &self.ethereum(),
+            &self.token_id,
+            &DestinationCapability::DirectItsTransfer,
+        );
+        self.bare().set_destination_capability(
+            &self.ethereum(),
+            &self.lock_asset,
+            &DestinationCapability::DirectItsTransfer,
+        );
     }
 
     pub fn fund_user(&self, amount: i128) {

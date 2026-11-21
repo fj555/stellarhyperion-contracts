@@ -9,3 +9,4 @@ mod outbound;
 mod quotes;
 mod stateful_model;
 mod storage_maintenance;
+mod trust_surface;

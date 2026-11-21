@@ -10,6 +10,9 @@ import {
     InvalidDestination,
     RailNotConfigured,
     RefundFailed,
+    TimelockDelayOutOfRange,
+    TimelockNotQueued,
+    TimelockNotReady,
     TokenNotMapped,
     Unauthorized,
     UnknownChain,
@@ -78,6 +81,10 @@ contract CctpAdapterTest is Fixture {
     event BurnSubmitted(
         string chain, uint32 domain, uint256 amount, bytes32 mintRecipient, uint64 nonce, bytes hookData
     );
+    event PeerRotationQueued(string indexed chain, bytes32 currentPeer, bytes32 newPeer, uint64 eta);
+    event PeerRotationApplied(string indexed chain, bytes32 oldPeer, bytes32 newPeer, uint64 overlapDeadline);
+    event PeerRotationCancelled(string indexed chain, bytes32 cancelledPeer);
+    event FinalityPolicyUsed(string chain, uint32 indexed domain, uint32 minFinalityThreshold);
 
     function setUp() public override {
         super.setUp();
@@ -122,6 +129,17 @@ contract CctpAdapterTest is Fixture {
     /// sender who was quoted a fee of zero would find one had appeared by the time it landed.
     function test_the_finality_tier_is_the_one_that_costs_nothing() public view {
         assertEq(adapter.FINALITY_THRESHOLD_FINALIZED(), 2000);
+        assertEq(adapter.quoteFinalityPolicy(STELLAR), 2000);
+    }
+
+    function test_finality_quote_rejects_unknown_or_disabled_lanes() public {
+        vm.expectRevert(UnknownChain.selector);
+        adapter.quoteFinalityPolicy("unknown");
+
+        vm.prank(admin);
+        adapter.setLaneEnabled(STELLAR, false);
+        vm.expectRevert(RailNotConfigured.selector);
+        adapter.quoteFinalityPolicy(STELLAR);
     }
 
     /// @dev Not "zero for now". CCTP bills nothing at send time on this tier, so there is no
@@ -409,6 +427,8 @@ contract CctpAdapterTest is Fixture {
         emit BurnSubmitted(
             STELLAR, STELLAR_DOMAIN, AMOUNT, MINT_RECIPIENT, NONCE, _hook(AddressKind.Account, G_KEY, 0)
         );
+        vm.expectEmit(false, true, false, true, address(adapter));
+        emit FinalityPolicyUsed(STELLAR, STELLAR_DOMAIN, 2000);
         vm.prank(address(router));
         adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
     }
@@ -612,6 +632,154 @@ contract CctpAdapterTest is Fixture {
             assertEq(messenger.burnCount(), count + 1);
             assertEq(asset.allowance(address(fresh), address(messenger)), 0);
         }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Peer messenger rotation & overlap controls
+    // -------------------------------------------------------------------------------------
+
+    function test_propose_peer_rotation_records_pending_and_emits() public {
+        bytes32 newPeer = G_KEY;
+        uint64 delay = 1 hours;
+        uint64 expectedEta = uint64(block.timestamp) + delay;
+
+        vm.expectEmit(true, true, true, true, address(adapter));
+        emit PeerRotationQueued(STELLAR, MINT_RECIPIENT, newPeer, expectedEta);
+
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, newPeer, delay);
+
+        CctpAdapter.PeerRotation memory pending = adapter.pendingRotationOf(STELLAR);
+        assertEq(pending.newMintRecipient, newPeer);
+        assertEq(pending.eta, expectedEta);
+        assertEq(pending.queuedAt, block.timestamp);
+    }
+
+    function test_propose_peer_rotation_refuses_unknown_chain() public {
+        vm.prank(admin);
+        vm.expectRevert(UnknownChain.selector);
+        adapter.proposePeerRotation("unknown", G_KEY, 1 hours);
+    }
+
+    function test_propose_peer_rotation_refuses_zero_address() public {
+        vm.prank(admin);
+        vm.expectRevert(ZeroAddress.selector);
+        adapter.proposePeerRotation(STELLAR, bytes32(0), 1 hours);
+    }
+
+    function test_propose_peer_rotation_refuses_same_peer() public {
+        vm.prank(admin);
+        vm.expectRevert(AlreadyConfigured.selector);
+        adapter.proposePeerRotation(STELLAR, MINT_RECIPIENT, 1 hours);
+    }
+
+    function test_propose_peer_rotation_refuses_delay_below_minimum() public {
+        vm.prank(admin);
+        vm.expectRevert(TimelockDelayOutOfRange.selector);
+        adapter.proposePeerRotation(STELLAR, G_KEY, 1 hours - 1);
+    }
+
+    function test_propose_peer_rotation_refuses_already_pending() public {
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, G_KEY, 1 hours);
+
+        vm.prank(admin);
+        vm.expectRevert(AlreadyConfigured.selector);
+        adapter.proposePeerRotation(STELLAR, G_KEY, 1 hours);
+    }
+
+    function test_apply_peer_rotation_refuses_when_not_queued() public {
+        vm.prank(admin);
+        vm.expectRevert(TimelockNotQueued.selector);
+        adapter.applyPeerRotation(STELLAR);
+    }
+
+    function test_apply_peer_rotation_refuses_before_eta() public {
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, G_KEY, 1 hours);
+
+        vm.warp(block.timestamp + 1 hours - 1);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(TimelockNotReady.selector, block.timestamp + 1));
+        adapter.applyPeerRotation(STELLAR);
+    }
+
+    function test_apply_peer_rotation_updates_peer_and_sets_overlap_window() public {
+        bytes32 newPeer = G_KEY;
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, newPeer, 1 hours);
+
+        vm.warp(block.timestamp + 1 hours);
+        uint64 expectedOverlapDeadline = uint64(block.timestamp) + 1 days;
+
+        vm.expectEmit(true, true, true, true, address(adapter));
+        emit PeerRotationApplied(STELLAR, MINT_RECIPIENT, newPeer, expectedOverlapDeadline);
+
+        vm.prank(admin);
+        adapter.applyPeerRotation(STELLAR);
+
+        assertEq(adapter.laneOf(STELLAR).mintRecipient, newPeer);
+        assertEq(adapter.pendingRotationOf(STELLAR).eta, 0);
+
+        CctpAdapter.HistoricalPeer memory hist = adapter.historicalPeerOf(STELLAR);
+        assertEq(hist.oldMintRecipient, MINT_RECIPIENT);
+        assertEq(hist.validUntil, expectedOverlapDeadline);
+    }
+
+    function test_cancel_peer_rotation_clears_pending() public {
+        bytes32 newPeer = G_KEY;
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, newPeer, 1 hours);
+
+        vm.expectEmit(true, true, true, true, address(adapter));
+        emit PeerRotationCancelled(STELLAR, newPeer);
+
+        vm.prank(admin);
+        adapter.cancelPeerRotation(STELLAR);
+
+        assertEq(adapter.pendingRotationOf(STELLAR).eta, 0);
+        assertEq(adapter.laneOf(STELLAR).mintRecipient, MINT_RECIPIENT);
+    }
+
+    function test_cancel_peer_rotation_refuses_when_not_queued() public {
+        vm.prank(admin);
+        vm.expectRevert(TimelockNotQueued.selector);
+        adapter.cancelPeerRotation(STELLAR);
+    }
+
+    function test_dispatch_uses_new_peer_after_rotation() public {
+        bytes32 newPeer = G_KEY;
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, newPeer, 1 hours);
+
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(admin);
+        adapter.applyPeerRotation(STELLAR);
+
+        _fund(AMOUNT);
+        vm.prank(address(router));
+        adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
+
+        MockTokenMessenger.Burn memory burn = messenger.lastBurn();
+        assertEq(burn.mintRecipient, newPeer);
+    }
+
+    function test_disabled_lane_blocks_dispatch_regardless_of_rotation() public {
+        bytes32 newPeer = G_KEY;
+        vm.prank(admin);
+        adapter.proposePeerRotation(STELLAR, newPeer, 1 hours);
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(admin);
+        adapter.applyPeerRotation(STELLAR);
+
+        // Emergency disable the lane
+        vm.prank(admin);
+        adapter.setLaneEnabled(STELLAR, false);
+
+        _fund(AMOUNT);
+        vm.prank(address(router));
+        vm.expectRevert(RailNotConfigured.selector);
+        adapter.dispatch(address(usdc), AMOUNT, _dest(G_ADDR), NONCE);
     }
 
     // -------------------------------------------------------------------------------------

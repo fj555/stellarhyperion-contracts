@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "candidate": {
+    "rail": "allbridge",
+    "sourceNetwork": "stellar-testnet",
+    "direction": "outbound",
+    "destination": "ethereum",
+    "allbridgeChainId": 2,
+    "localToken": "CLOCALASSET",
+    "receiveToken": "abababababababababababababababababababababababababababababababab"
+  },
+  "evidence": {
+    "authorization": {
+      "status": "development-only",
+      "developmentOnly": true,
+      "references": ["fixture:development-authorization"],
+      "verifiedBy": "fixture",
+      "checkedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-11-20T00:00:00Z",
+      "routerAddress": "fixture-router",
+      "adminAddress": "fixture-admin",
+      "dispatchAuthority": "router"
+    },
+    "pool": {
+      "status": "verified",
+      "references": ["fixture:pool"],
+      "verifiedBy": "fixture",
+      "checkedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-11-20T00:00:00Z",
+      "poolAddress": "fixture-pool",
+      "token": "CLOCALASSET"
+    },
+    "liquidity": {
+      "status": "verified",
+      "references": ["fixture:liquidity"],
+      "verifiedBy": "fixture",
+      "checkedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-11-20T00:00:00Z",
+      "amountAtomic": "9007199254740993",
+      "token": "CLOCALASSET"
+    },
+    "validator": {
+      "status": "verified",
+      "references": ["fixture:validator"],
+      "verifiedBy": "fixture",
+      "checkedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-11-20T00:00:00Z",
+      "trustModel": "configured-validator",
+      "validatorPublicKey": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "authority": "fixture-authority"
+    },
+    "railValidation": {
+      "status": "verified",
+      "references": ["fixture:independent-validation"],
+      "verifiedBy": "independent-reviewer",
+      "checkedAt": "2026-11-20T00:00:00Z",
+      "expiresAt": "2027-11-20T00:00:00Z",
+      "scope": "stellar-testnet:outbound:ethereum"
+    }
+  }
+}

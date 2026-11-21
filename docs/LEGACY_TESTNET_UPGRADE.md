@@ -89,7 +89,17 @@ stellar contract invoke --id "$ADAPTER" --source-account "$STELLAR_IDENTITY" --n
 stellar contract invoke --id "$ADAPTER" --source-account "$STELLAR_IDENTITY" --network testnet --is-view -- get_link --chain sepolia
 ```
 
-Mapping and linking can overwrite existing configuration; read before retrying and stop on an unexpected value. The old `script/stellar/link.sh` is a general multi-rail helper and is not the acceptance test for this direct ITS lane.
+Read the mapping before retrying, and stop on an unexpected value. `map_token` refuses to repoint an
+existing mapping in either direction rather than overwriting it, and repeating a mapping that is
+already in place succeeds without changing anything or publishing a second event. To see which
+fields would disagree before sending anything, run the read-only diagnostic:
+
+```bash
+stellar contract invoke --id "$ADAPTER" --source-account "$STELLAR_IDENTITY" --network testnet --is-view -- check_token_mapping --token "$TOKEN" --token_id "$TOKEN_ID" --expected_decimals 7
+```
+
+It writes nothing, so it is safe to repeat. The old `script/stellar/link.sh` is a general
+multi-rail helper and is not the acceptance test for this direct ITS lane.
 
 Update the canonical deployment record only after confirmed execution, preserving transaction hashes, action id and artifact hashes. Copy that record to the frontend/backend and commit the deployment evidence separately.
 

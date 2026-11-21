@@ -63,6 +63,7 @@ import {
     RouteQuoteV2,
     TokenConfig
 } from "./HyperionTypes.sol";
+import {IAxelarItsIntentAdapter} from "./interfaces/IAxelarItsIntentAdapter.sol";
 import {IHyperionRouter} from "./interfaces/IHyperionRouter.sol";
 import {IRailAdapter} from "./interfaces/IRailAdapter.sol";
 import {AmountMath} from "./libraries/AmountMath.sol";
@@ -287,9 +288,16 @@ contract HyperionRouter is IHyperionRouter, AccessControl, Pausable, ReentrancyG
         nonce = ++outboundNonce;
 
         uint256 balanceBefore = address(this).balance - msg.value;
-        bytes32 railRef = IRailAdapter(plan.adapterAddress).dispatch{value: msg.value}(
-            request.token, plan.net, request.destination, nonce
-        );
+        bytes32 railRef;
+        if (request.route == RouteKind.AxelarIts) {
+            railRef = IAxelarItsIntentAdapter(plan.adapterAddress).dispatchWithSender{value: msg.value}(
+                request.token, plan.net, request.destination, nonce, msg.sender
+            );
+        } else {
+            railRef = IRailAdapter(plan.adapterAddress).dispatch{value: msg.value}(
+                request.token, plan.net, request.destination, nonce
+            );
+        }
 
         _announceOutbound(request, plan, nonce, railRef);
 

@@ -97,9 +97,90 @@ pub struct FeePolicySet {
 
 #[contractevent(topics = ["hyperion", "cctp_cfg"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaneFinalityPolicySet {
+    #[topic]
+    pub domain: u32,
+    pub min_finality_threshold: u32,
+}
+
+#[contractevent(topics = ["hyperion", "cctp_cfg"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChanged {
     #[topic]
     pub old: Address,
     #[topic]
     pub new: Address,
+}
+
+/// A remote peer messenger rotation was proposed.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerRotationQueued {
+    #[topic]
+    pub domain: u32,
+    pub current_peer: BytesN<32>,
+    pub new_peer: BytesN<32>,
+    pub eta: u64,
+}
+
+/// A remote peer messenger rotation was applied.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerRotationApplied {
+    #[topic]
+    pub domain: u32,
+    pub old_peer: BytesN<32>,
+    pub new_peer: BytesN<32>,
+    pub overlap_deadline: u64,
+}
+
+/// A remote peer messenger rotation was cancelled.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerRotationCancelled {
+    #[topic]
+    pub domain: u32,
+    pub cancelled_peer: BytesN<32>,
+}
+
+/// A local TokenMessenger rotation was proposed.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessengerRotationQueued {
+    #[topic]
+    pub current_messenger: Address,
+    #[topic]
+    pub new_messenger: Address,
+    pub eta: u64,
+    pub queued_at: u64,
+}
+
+/// A local TokenMessenger rotation was applied.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessengerRotationApplied {
+    #[topic]
+    pub old_messenger: Address,
+    #[topic]
+    pub new_messenger: Address,
+    pub overlap_deadline: u64,
+}
+
+/// A local TokenMessenger rotation was cancelled.
+#[contractevent(topics = ["hyperion", "cctp_rotation"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessengerRotationCancelled {
+    #[topic]
+    pub current_messenger: Address,
+    #[topic]
+    pub cancelled_messenger: Address,
+}
+
+/// A domain's active routing was enabled or disabled.
+#[contractevent(topics = ["hyperion", "cctp_cfg"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainEnabled {
+    #[topic]
+    pub domain: u32,
+    pub enabled: bool,
 }

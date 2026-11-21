@@ -1,5 +1,5 @@
 use hyperion_core::{FlowWindow, HyperionError, RouteKind};
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN, Env, IntoVal, Val};
 
 use crate::types::{
     ClaimProvenance, Config, MigrationStatus, PendingClaim, QueuedAction, RouteConfig, TokenConfig,
@@ -97,19 +97,32 @@ pub fn claim_liability(env: &Env, token: &Address) -> i128 {
         .unwrap_or(0)
 }
 
+// Encode the same liability key once and share storage access across both checked operations.
+#[inline(never)]
+fn adjust_claim_liability(
+    env: &Env,
+    token: &Address,
+    amount: i128,
+    decrease: bool,
+) -> Result<(), HyperionError> {
+    let key: Val = DataKey::ClaimLiability(token.clone()).into_val(env);
+    let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+    let next = if decrease {
+        current.checked_sub(amount).filter(|next| *next >= 0)
+    } else {
+        current.checked_add(amount)
+    }
+    .ok_or(HyperionError::InvalidAmount)?;
+    env.storage().instance().set(&key, &next);
+    Ok(())
+}
+
 pub fn increase_claim_liability(
     env: &Env,
     token: &Address,
     amount: i128,
 ) -> Result<(), HyperionError> {
-    let current = claim_liability(env, token);
-    let next = current
-        .checked_add(amount)
-        .ok_or(HyperionError::InvalidAmount)?;
-    env.storage()
-        .instance()
-        .set(&DataKey::ClaimLiability(token.clone()), &next);
-    Ok(())
+    adjust_claim_liability(env, token, amount, false)
 }
 
 pub fn decrease_claim_liability(
@@ -117,36 +130,28 @@ pub fn decrease_claim_liability(
     token: &Address,
     amount: i128,
 ) -> Result<(), HyperionError> {
-    let current = claim_liability(env, token);
-    let next = current
-        .checked_sub(amount)
-        .filter(|next| *next >= 0)
-        .ok_or(HyperionError::InvalidAmount)?;
-    env.storage()
-        .instance()
-        .set(&DataKey::ClaimLiability(token.clone()), &next);
-    Ok(())
+    adjust_claim_liability(env, token, amount, true)
 }
 
 // The three monotonic sequences retain their distinct keys and checked increment behavior.
 #[inline(never)]
-fn next_counter(env: &Env, key: &DataKey) -> u64 {
+fn next_counter(env: &Env, key: &Val) -> u64 {
     let next = read_counter(env, key) + 1;
     env.storage().instance().set(key, &next);
     next
 }
 
 #[inline(never)]
-fn read_counter(env: &Env, key: &DataKey) -> u64 {
+fn read_counter(env: &Env, key: &Val) -> u64 {
     env.storage().instance().get(key).unwrap_or(0u64)
 }
 
 pub fn next_out_nonce(env: &Env) -> u64 {
-    next_counter(env, &DataKey::OutNonce)
+    next_counter(env, &DataKey::OutNonce.into_val(env))
 }
 
 pub fn out_nonce(env: &Env) -> u64 {
-    read_counter(env, &DataKey::OutNonce)
+    read_counter(env, &DataKey::OutNonce.into_val(env))
 }
 
 pub fn adapter(env: &Env, route: RouteKind) -> Result<Address, HyperionError> {
@@ -355,11 +360,11 @@ pub fn assert_liability_migration_not_running(env: &Env) -> Result<(), HyperionE
 }
 
 pub fn next_claim_id(env: &Env) -> u64 {
-    next_counter(env, &DataKey::ClaimSeq)
+    next_counter(env, &DataKey::ClaimSeq.into_val(env))
 }
 
 pub fn claim_count(env: &Env) -> u64 {
-    read_counter(env, &DataKey::ClaimSeq)
+    read_counter(env, &DataKey::ClaimSeq.into_val(env))
 }
 
 pub fn claim(env: &Env, id: u64) -> Option<PendingClaim> {
@@ -435,11 +440,11 @@ pub fn set_claim_provenance(env: &Env, id: u64, value: &ClaimProvenance) {
 }
 
 pub fn next_queue_id(env: &Env) -> u64 {
-    next_counter(env, &DataKey::QueueSeq)
+    next_counter(env, &DataKey::QueueSeq.into_val(env))
 }
 
 pub fn queue_count(env: &Env) -> u64 {
-    read_counter(env, &DataKey::QueueSeq)
+    read_counter(env, &DataKey::QueueSeq.into_val(env))
 }
 
 pub fn queued(env: &Env, id: u64) -> Option<QueuedAction> {

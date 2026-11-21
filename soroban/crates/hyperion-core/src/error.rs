@@ -104,4 +104,14 @@ pub enum HyperionError {
     ProviderBudgetExceeded = 48,
     // The configured adapter has no supported read-only dispatch validation interface.
     AdapterMethodUnavailable = 49,
+    // A messenger rotation is already pending; apply or cancel it before proposing another.
+    RotationAlreadyPending = 50,
+    // No messenger rotation is pending; nothing to apply or cancel.
+    RotationNotPending = 51,
+    // The messenger rotation timelock has not elapsed yet.
+    RotationNotReady = 52,
+    // The proposed new messenger is the same as the current one.
+    MessengerUnchanged = 53,
+    // A message from the retired old messenger arrived outside the overlap acceptance window.
+    OldMessengerExpired = 54,
 }

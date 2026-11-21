@@ -9,6 +9,13 @@
  * strkey codec, checks every rail name against the real route list, and names the field it choked
  * on. A malformed record never reaches disk.
  *
+ * Deprecation: a record may be marked archived by setting HYPERION_STATUS=archived together with
+ * HYPERION_SUCCESSOR_ROUTER (the router that replaces it) and HYPERION_ARCHIVE_REASON. An archived
+ * record keeps every historical field, including queued actions and deployedAt, so the evidence of
+ * what happened is never discarded. Its status is recorded in parsed metadata (`status`,
+ * `successor`), so consumers can tell active and archived records apart without string matching,
+ * and an archived record is refused as an activation target by the caller of this script.
+ *
  * Reads its inputs from the environment because its caller is a shell script and marshalling two
  * dozen values through argv would be worse. Writes nothing but the file it was asked for, and
  * nothing it writes came from a secret: only the deployer's public address appears.
@@ -84,6 +91,34 @@ function commit() {
   }
 }
 
+/**
+ * Lifecycle status of the record. Only two values exist on purpose: a record is either the live
+ * deployment or a retired one that points at its successor. Anything else is a typo we refuse.
+ */
+function lifecycle() {
+  const status = process.env.HYPERION_STATUS || "active";
+  if (status === "active") {
+    if (process.env.HYPERION_SUCCESSOR_ROUTER || process.env.HYPERION_ARCHIVE_REASON) {
+      throw new Error("an active record must not carry a successor or archive reason");
+    }
+    return { status: "active" };
+  }
+  if (status === "archived") {
+    const successorRouter = need("HYPERION_SUCCESSOR_ROUTER");
+    const reason = need("HYPERION_ARCHIVE_REASON");
+    if (successorRouter === need("HYPERION_ROUTER")) {
+      throw new Error("an archived record cannot name its own router as the successor");
+    }
+    return {
+      status: "archived",
+      archivedAt: new Date().toISOString(),
+      archiveReason: reason,
+      successor: { router: successorRouter },
+    };
+  }
+  throw new Error(`HYPERION_STATUS must be "active" or "archived", got "${status}"`);
+}
+
 const asset = need("HYPERION_ASSET");
 const [code, issuer] = asset.split(":");
 if (code === undefined || issuer === undefined) {
@@ -140,10 +175,11 @@ const deployment = {
     timestamp: new Date().toISOString(),
   },
   commit: commit(),
+  ...lifecycle(),
 
   // Phase two reads these, and a reviewer checks them against the chain. The validator ignores
   // fields it does not know about, which is what lets a record carry handover state as well as
-  // addresses.
+  // addresses. Queued actions are kept on archived records too: they are historical evidence.
   deployer: need("HYPERION_DEPLOYER"),
   peerChain: need("HYPERION_PEER_CHAIN"),
   queuedActionIds: JSON.parse(process.env.QUEUE_IDS_JSON ?? "[]"),

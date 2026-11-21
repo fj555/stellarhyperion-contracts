@@ -122,3 +122,38 @@ and 4 inexact token payout. Existing batch status values remain fixed; `TokenUna
 recipient, and a later successful retry clears the reason. Soroban's documented whole-batch
 rollback for successful nonconforming token changes remains different because its host does not
 support the EVM item's invocation rollback mechanism. These local changes activate no deployment.
+
+## EVM-development Axelar ITS gas top-ups
+
+Each EVM Axelar ITS dispatch records a fixed-size intent keyed by the router nonce, adapter,
+original sender, token/token id, original amount, and a hash of the Hyperion and Axelar destination
+bindings. The router uses an additive sender-aware adapter entry point for ITS; the adapter accepts
+that call only from its configured router.
+
+The updated router requires the configured ITS adapter to implement `dispatchWithSender`; it does
+not fall back to the legacy `dispatch` selector. An older adapter therefore causes ITS outbound
+dispatches through this router to revert. Before enabling this EVM development path, deploy the
+compatible adapter and update the router's adapter configuration through its timelock. This does
+not migrate intents from an older adapter; its already in-flight messages cannot use this top-up
+entry point.
+
+Destination chain names are limited to 64 bytes and Stellar strkeys to 69 bytes before they enter
+that intent. A top-up must echo the recorded destination binding, token id, token address, and
+original amount, and the original sender must make the top-up call; these fields are checked, not
+used to make another transfer. The top-up path only forwards native currency to Axelar's gas
+service, so it cannot change the recipient, token, or amount of the original ITS transfer.
+
+The original sender's first top-up binds the intent to an explicit Axelar source transaction
+hash/log index and chosen refund recipient. Later calls must come from the same sender and repeat
+the exact message and refund binding. Axelar's gas-service API accepts that source-log reference but
+does not expose a way for this adapter to inspect the receipt and prove the reference identifies
+the ITS log; operators must take it from the original transaction's Axelar ITS event. Once bound, the message reference and refund address cannot be changed, and a message reference cannot bind
+to another intent. Each intent has one cumulative
+native-spend cap in wei, set at its first top-up; each payment is checked against the remaining
+amount before calling Axelar. Axelar sends any later refund to the bound refund recipient.
+
+Top-ups intentionally are not replay-rejected: more than one payment to the same bound message
+is valid if the cumulative cap permits it. The message/refund binding and cap are immutable after
+the first payment, and repeated identical calls cannot spend beyond the remaining cap. A new
+dispatch has a different nonce and therefore a different intent. This remains an EVM-development
+path and does not change the active Stellar Testnet deployment gate.

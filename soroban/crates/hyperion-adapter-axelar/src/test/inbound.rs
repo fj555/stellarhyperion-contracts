@@ -116,6 +116,11 @@ fn two_message_ids_that_would_collide_if_they_were_glued_together_both_go_throug
     w.its().set_trusted(&short, &true);
     w.adapter()
         .link_chain(&String::from_str(&w.env, "ethereu"), &short, &w.peer());
+    w.adapter().set_destination_capability(
+        &String::from_str(&w.env, "ethereu"),
+        &w.token_id,
+        &hyperion_core::axelar::DestinationCapability::GmpPayload,
+    );
 
     // "Ethereum" plus "1" and "Ethereu" plus "m1" are the same eight characters in a row. Under
     // a naive join the second delivery would look like a replay of the first and be refused,
@@ -522,6 +527,11 @@ fn in_flight_messages_transition_during_and_after_peer_rotation() {
         li.timestamp += 3_600;
     });
     w.adapter().apply_peer_rotation(&w.ethereum());
+    w.adapter().set_destination_capability(
+        &w.ethereum(),
+        &w.token_id,
+        &hyperion_core::axelar::DestinationCapability::GmpPayload,
+    );
 
     // After rotation is applied:
     // 3. Deliveries from the new peer now succeed!
@@ -630,6 +640,11 @@ fn cutover_keeps_replay_guard_and_recipient_bound_claims_intact() {
         .propose_peer_rotation(&w.ethereum(), &next_peer, &3_600);
     w.env.ledger().with_mut(|li| li.timestamp += 3_600);
     w.adapter().apply_peer_rotation(&w.ethereum());
+    w.adapter().set_destination_capability(
+        &w.ethereum(),
+        &w.token_id,
+        &hyperion_core::axelar::DestinationCapability::GmpPayload,
+    );
     let source = Bytes::from_array(&w.env, &next_peer.to_array());
     assert!(w
         .its()

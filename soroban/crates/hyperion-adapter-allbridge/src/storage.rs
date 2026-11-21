@@ -59,7 +59,23 @@ pub fn chain_of(env: &Env, allbridge_chain_id: u32) -> Option<String> {
         .get(&DataKey::Chain(allbridge_chain_id))
 }
 
-pub fn set_lane(env: &Env, lane: &ChainLane) {
+/// Write a lane only when it is new or byte for byte the same.
+///
+/// Re-running a deploy script is harmless; repointing a live lane is not. A lane change has to be
+/// an explicit migration decision, not the side effect of somebody re-validating an old mapping.
+pub fn set_lane(env: &Env, lane: &ChainLane) -> Result<(), HyperionError> {
+    if let Some(current) = self::lane(env, &lane.chain) {
+        if current != *lane {
+            return Err(HyperionError::AlreadyConfigured);
+        }
+        return Ok(());
+    }
+    if let Some(other) = chain_of(env, lane.allbridge_chain_id) {
+        if other != lane.chain {
+            return Err(HyperionError::AlreadyConfigured);
+        }
+    }
+
     let by_name = DataKey::Lane(lane.chain.clone());
     let by_id = DataKey::Chain(lane.allbridge_chain_id);
     env.storage().persistent().set(&by_name, lane);
@@ -70,6 +86,7 @@ pub fn set_lane(env: &Env, lane: &ChainLane) {
     env.storage()
         .persistent()
         .extend_ttl(&by_id, BUMP_THRESHOLD, BUMP_TO);
+    Ok(())
 }
 
 pub fn asset(env: &Env, token: &Address, allbridge_chain_id: u32) -> Option<AssetLink> {
@@ -83,12 +100,25 @@ pub fn asset(env: &Env, token: &Address, allbridge_chain_id: u32) -> Option<Asse
     found
 }
 
-pub fn set_asset(env: &Env, link: &AssetLink) {
+/// Write an asset link only when it is new or byte for byte the same.
+///
+/// An identical re-link is how an operator revalidates an unchanged mapping. A different receive
+/// token on the same lane is a migration: it would change where every later transfer pays out,
+/// so it is refused here rather than written as though nothing happened.
+pub fn set_asset(env: &Env, link: &AssetLink) -> Result<(), HyperionError> {
+    if let Some(current) = self::asset(env, &link.token, link.allbridge_chain_id) {
+        if current != *link {
+            return Err(HyperionError::AlreadyConfigured);
+        }
+        return Ok(());
+    }
+
     let key = DataKey::Asset(link.token.clone(), link.allbridge_chain_id);
     env.storage().persistent().set(&key, link);
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+    Ok(())
 }
 
 /// Push a lane's expiry out without changing it. No-op when there is no such lane.

@@ -9,6 +9,7 @@ import {AxelarItsAdapter} from "../src/adapters/AxelarItsAdapter.sol";
 import {CctpAdapter} from "../src/adapters/CctpAdapter.sol";
 
 import {DeployConfig} from "./DeployConfig.sol";
+import {OwnershipReport} from "./OwnershipReport.sol";
 
 /// @title Phase one of a Hyperion deployment: put the contracts on chain and start the clock
 /// @author dotmantissa
@@ -190,6 +191,12 @@ contract Deploy is DeployConfig {
         vm.serializeAddress(key, "deployer", deployer);
         vm.serializeAddress(key, "admin", params.admin);
         vm.serializeAddress(key, "guardian", params.guardian);
+        OwnershipReport.RouterState memory authority =
+            OwnershipReport.routerState(router, deployer, params.guardian);
+        vm.serializeBytes32(key, "routerAdminRole", authority.adminRole);
+        vm.serializeBytes32(key, "routerGuardianRole", authority.guardianRole);
+        vm.serializeBool(key, "deployerAdminActiveAtRecord", authority.expectedAdminActive);
+        vm.serializeBool(key, "guardianActiveAtRecord", authority.expectedGuardianActive);
         vm.serializeAddress(key, "treasury", params.treasury);
         vm.serializeUint(key, "feeBps", params.feeBps);
         vm.serializeUint(key, "timelockDelay", params.timelockDelay);
@@ -199,12 +206,21 @@ contract Deploy is DeployConfig {
         vm.serializeString(key, "stellarChain", stellarChain());
 
         vm.serializeAddress(key, "cctpAdapter", address(cctp));
+        OwnershipReport.AdapterState memory cctpAuthority = OwnershipReport.adapterState(address(cctp));
+        vm.serializeAddress(key, "cctpOwnerAtRecord", cctpAuthority.owner);
+        vm.serializeAddress(key, "cctpPendingOwnerAtRecord", cctpAuthority.pendingOwner);
+        vm.serializeAddress(key, "cctpRouterAtRecord", cctpAuthority.router);
         vm.serializeAddress(key, "cctpTokenMessenger", rails.cctpTokenMessenger);
         vm.serializeAddress(key, "cctpMessageTransmitter", rails.cctpMessageTransmitter);
         vm.serializeBytes32(key, "stellarRailRecipient", stellarRailRecipient());
 
         if (axelarToo) {
             vm.serializeAddress(key, "axelarAdapter", address(axelar));
+            OwnershipReport.AdapterState memory axelarAuthority =
+                OwnershipReport.adapterState(address(axelar));
+            vm.serializeAddress(key, "axelarOwnerAtRecord", axelarAuthority.owner);
+            vm.serializeAddress(key, "axelarPendingOwnerAtRecord", axelarAuthority.pendingOwner);
+            vm.serializeAddress(key, "axelarRouterAtRecord", axelarAuthority.router);
             vm.serializeAddress(key, "axelarIts", rails.axelarIts);
             vm.serializeAddress(key, "axelarGasService", rails.axelarGasService);
             vm.serializeString(key, "axelarStellarChain", axelarStellarChain());

@@ -126,7 +126,7 @@ fn the_pool_is_looked_up_fresh_on_every_transfer() {
     // Allbridge's admin can repoint an asset at a different pool whenever they like. A copy of
     // the old address kept here would authorise a transfer into a contract that is no longer
     // part of the rail.
-    w.bridge().add_pool(&moved, &w.token_key(&w.token_id));
+    w.bridge().add_pool(&moved, &w.token_id);
 
     assert_eq!(w.adapter().pool_for(&w.token_id), moved);
     w.router().bridge_out(&w.user, &w.request(HUNDRED));
@@ -252,6 +252,60 @@ fn an_asset_nobody_mapped_is_refused() {
         ),
         Err(Ok(HyperionError::TokenNotMapped))
     );
+}
+
+#[test]
+fn a_pool_repointed_at_another_token_stops_the_dispatch_before_the_sale() {
+    let w = World::new();
+    w.fund_adapter(HUNDRED);
+    // Allbridge's admin can repoint the pool behind a token. If that pool sells a different
+    // asset, the mapping is no longer one this adapter may use, even though the local token and
+    // the destination word have not changed.
+    let wrong = w.env.register(MockPool, ());
+    MockPoolClient::new(&w.env, &wrong).initialize(&w.bridge_id, &w.orphan_id, &POOL_FEE_BPS);
+    w.bridge().add_pool(&wrong, &w.orphan_id);
+    w.bridge().repoint_pool(&w.token_id, &wrong);
+
+    assert_eq!(
+        w.adapter().try_dispatch(
+            &w.router_id,
+            &w.token_id,
+            &HUNDRED,
+            &w.ethereum(),
+            &w.evm(0x01),
+            &1,
+        ),
+        Err(Ok(HyperionError::TokenNotMapped))
+    );
+    // Nothing was sold, nothing was relayed, and the funds are still sitting here for `sweep`.
+    assert_eq!(w.pool().sold(), 0);
+    assert_eq!(MockPoolClient::new(&w.env, &wrong).sold(), 0);
+    assert_eq!(w.bridge().sent_count(), 0);
+    assert_eq!(w.token().balance(&w.adapter_id), HUNDRED);
+}
+
+#[test]
+fn precision_drift_stops_the_dispatch_before_the_sale() {
+    let w = World::new();
+    w.fund_adapter(HUNDRED);
+    // The factor Allbridge recorded when it added the pool is part of the accounting assumption.
+    // A token that no longer agrees with it must not be sold at a precision nobody quoted.
+    w.bridge().set_oracle_factor(&w.token_id, &1);
+
+    assert_eq!(
+        w.adapter().try_dispatch(
+            &w.router_id,
+            &w.token_id,
+            &HUNDRED,
+            &w.ethereum(),
+            &w.evm(0x01),
+            &1,
+        ),
+        Err(Ok(HyperionError::InvalidDecimals))
+    );
+    assert_eq!(w.pool().sold(), 0);
+    assert_eq!(w.bridge().sent_count(), 0);
+    assert_eq!(w.token().balance(&w.adapter_id), HUNDRED);
 }
 
 #[test]

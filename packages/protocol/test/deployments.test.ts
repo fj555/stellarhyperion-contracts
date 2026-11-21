@@ -5,9 +5,11 @@ import {
   adapterFor,
   deployedChains,
   deploymentFor,
+  hasValidatedOutboundQuoteWiring,
   isEvmDeployment,
   isStellarDeployment,
   parseDeploymentSet,
+  providerAddressOverridesFromDeploymentSet,
   tokenFor,
 } from "../src/deployments.js";
 import { RouteKind } from "../src/routes.js";
@@ -105,6 +107,37 @@ describe("reading a record that holds together", () => {
     }
   });
 
+  it("reads explicit provider addresses without changing declared asset metadata", () => {
+    const parsed = parseDeploymentSet(
+      set({
+        base: evmRecord({
+          tokens: {
+            USDC: {
+              address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+              decimals: 6,
+              flowLimit: "1000000000000",
+              routes: ["cctp"],
+              providerAddresses: { cctp: "0x6666666666666666666666666666666666666666" },
+            },
+          },
+        }),
+      }),
+    );
+    const deployment = parsed.networks.base;
+    if (deployment === undefined || !isEvmDeployment(deployment)) {
+      throw new Error("expected an EVM Base deployment");
+    }
+    const token = deployment.tokens.USDC;
+    expect(token?.address).toBe("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    expect(token?.decimals).toBe(6);
+    expect(token?.providerAddresses?.[RouteKind.Cctp]).toBe(
+      "0x6666666666666666666666666666666666666666",
+    );
+    expect(providerAddressOverridesFromDeploymentSet(parsed).base?.USDC?.[RouteKind.Cctp]).toBe(
+      "0x6666666666666666666666666666666666666666",
+    );
+  });
+
   it("holds both families in one set", () => {
     const parsed = parseDeploymentSet(set({ base: evmRecord(), stellar: stellarRecord() }));
     expect([...deployedChains(parsed)].sort()).toEqual(["base", "stellar"]);
@@ -122,7 +155,35 @@ describe("reading a record that holds together", () => {
   it("finds a token by symbol", () => {
     const parsed = parseDeploymentSet(set({ base: evmRecord() }));
     expect(tokenFor(parsed, "base", "USDC")?.decimals).toBe(6);
+    expect(tokenFor(parsed, "base", "USDC")?.providerAddresses).toBeUndefined();
     expect(tokenFor(parsed, "base", "EURC")).toBeNull();
+  });
+
+  it("keeps inverse-quote wiring gated to configured Stellar Testnet CCTP and ITS", () => {
+    const activeTestnet = stellarRecord({
+      adapters: { cctp: ROUTER_C, "axelar-its": C_ADDR },
+      tokens: {
+        USDC: {
+          sacId: ROUTER_C,
+          code: "USDC",
+          issuer: G_ADDR,
+          decimals: 7,
+          flowLimit: "10000000000000",
+          routes: ["cctp", "axelar-its"],
+        },
+      },
+    });
+    const parsed = parseDeploymentSet(set({ "stellar-testnet": activeTestnet }));
+    expect(hasValidatedOutboundQuoteWiring(parsed, "stellar-testnet", "USDC", RouteKind.Cctp)).toBe(
+      true,
+    );
+    expect(
+      hasValidatedOutboundQuoteWiring(parsed, "stellar-testnet", "USDC", RouteKind.AxelarIts),
+    ).toBe(true);
+    expect(
+      hasValidatedOutboundQuoteWiring(parsed, "stellar-testnet", "USDC", RouteKind.Allbridge),
+    ).toBe(false);
+    expect(hasValidatedOutboundQuoteWiring(parsed, "sepolia", "USDC", RouteKind.Cctp)).toBe(false);
   });
 
   it("keeps a flow ceiling as a string, because a big one does not survive a double", () => {
@@ -248,12 +309,66 @@ describe("refusing a record that does not", () => {
     expect(() => parseDeploymentSet(set({ base: evmRecord({ family: "solana" }) }))).toThrow(
       /"evm" or "stellar"/,
     );
+    expect(() => parseDeploymentSet(set({ base: evmRecord({ family: "stellar" }) }))).toThrow(
+      /chain family/,
+    );
   });
 
   it("refuses a wasm hash that is not sixty four hex characters", () => {
     expect(() =>
       parseDeploymentSet(set({ stellar: stellarRecord({ wasmHashes: { router: "abc" } }) })),
     ).toThrow(/64 lowercase hex/);
+  });
+
+  it("validates provider address format and declared route capability", () => {
+    for (const [providerAddresses, expected] of [
+      [{ cctp: "0xnope" }, /providerAddresses\.cctp/],
+      [{ allbridge: "0x6666666666666666666666666666666666666666" }, /provider rail/],
+      [{ teleport: "0x6666666666666666666666666666666666666666" }, /unknown rail slug/],
+    ] as const) {
+      expect(() =>
+        parseDeploymentSet(
+          set({
+            base: evmRecord({
+              tokens: {
+                USDC: {
+                  address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                  decimals: 6,
+                  flowLimit: "1",
+                  routes: ["cctp"],
+                  providerAddresses,
+                },
+              },
+            }),
+          }),
+        ),
+      ).toThrow(expected);
+    }
+  });
+
+  it("enforces safe numeric integers and uint256 string boundaries", () => {
+    const base = evmRecord();
+    expect(() =>
+      parseDeploymentSet(set({ base: evmRecord({ chainId: Number.MAX_SAFE_INTEGER + 1 }) })),
+    ).toThrow(/integer/);
+    expect(() =>
+      parseDeploymentSet(
+        set({
+          base: evmRecord({
+            tokens: {
+              USDC: {
+                address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                decimals: 6,
+                flowLimit:
+                  "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+                routes: ["cctp"],
+              },
+            },
+          }),
+        }),
+      ),
+    ).toThrow(/uint256/);
+    expect(parseDeploymentSet(set({ base })).networks.base).toBeDefined();
   });
 
   it("refuses something that is not an object at all", () => {
